@@ -1,0 +1,65 @@
+# =========================
+# OS / Editor junk
+# =========================
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Env / secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Node / build artifacts
+# =========================
+node_modules/
+dist/
+build/
+out/
+coverage/
+.cache/
+
+# Vite
+client/dist/
+client/.vite/
+
+# =========================
+# Project-specific folders
+# =========================
+# Backend temp/job output folders
+server/tmp/
+server/tmp/**
+
+# Invoices stored locally
+Invoices/
+Invoices/**
+
+# OCR model data (large)
+server/tessdata/
+server/tessdata/**
+
+# --- server/data: keep ONLY vendor list files ---
+server/data/*
+!server/data/Vendor List.xlsx
+!server/data/Vendor List.xlsx.txt
