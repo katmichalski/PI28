@@ -1,0 +1,34 @@
+# server/index.js OCR integration patch (manual apply)
+#
+# 1) Install deps in server/:
+#    npm i tesseract.js pdfjs-dist @napi-rs/canvas
+#
+# 2) Add these files:
+#    server/utils/ocr.js
+#    server/utils/pdfTextWithOcr.js
+#    (optional) server/utils/naming.js
+#
+# 3) In server/index.js:
+#
+#    Add near the top with other requires:
+#      const { extractPageTextsWithOcrFallback } = require("./utils/pdfTextWithOcr");
+#      // optional:
+#      // const { bestVendorFromList, guessVendorFromHeader, detectInvoiceNumber } = require("./utils/naming");
+#
+#    Then, wherever you do text extraction like:
+#      const texts = await extractPageTexts(file.buffer);
+#    replace with:
+#      const texts = await extractPageTextsWithOcrFallback(file.buffer, {
+#        minTextChars: 25,
+#        renderScale: 2.0,
+#      });
+#
+# 4) Naming improvements (optional):
+#    When building your invoice group name, use combined page text:
+#      const combined = groupPageTexts.join("\\n");
+#      const vendorMatch = bestVendorFromList(combined, vendorListNormalized);
+#      let vendorNormalized = vendorMatch || (guessVendorFromHeader(combined) ? normalizeVendorName(guessVendorFromHeader(combined)) : null);
+#      const invoiceNum = detectInvoiceNumber(combined);
+#      if (!vendorNormalized) vendorNormalized = "UNKNOWN";
+#
+# That’s it — OCR will kick in for scanned/image-only pages so vendor detection stops returning UNKNOWN.

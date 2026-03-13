@@ -1,0 +1,4 @@
+Place your real Excel file here as: "Vendor List.xlsx"
+Column A should contain vendor names.
+
+(This .txt is just a placeholder so the folder is visible in git.)
