@@ -189,7 +189,41 @@ function toLowerCamelCaseStem(stem) {
   }
   return out.join("");
 }
+function extractPageVendorNamesFromItem(item) {
+  const byPage = new Map();
 
+  const put = (pageLike, pageIndex, fallback = "", source = "derived") => {
+    const page = Number(pageIndex);
+    if (!Number.isFinite(page) || page < 1) return;
+
+    const name = resolveVendorName(pageLike, fallback) || "Unknown Vendor";
+    const current = byPage.get(page);
+    const next = { page, name, source };
+
+    const currentUnknown = !current || /^unknown vendor$/i.test(String(current.name || ""));
+    const nextUnknown = /^unknown vendor$/i.test(String(next.name || ""));
+
+    if (!current || (currentUnknown && !nextUnknown) || source === "group") {
+      byPage.set(page, next);
+    }
+  };
+
+  for (const page of item?.plan?.pageVendors || []) {
+    put(page, page?.page || page?.pageIndex, page?.vendorName || page?.vendorNorm || "", page?.source || "pageVendors");
+  }
+
+  for (const page of item?.plan?.pages || []) {
+    put(page, page?.pageIndex, page?.vendorName || page?.vendorNorm || "", "page");
+  }
+
+  for (const group of item?.groups || []) {
+    for (const pageNumber of Array.isArray(group?.pages) ? group.pages : []) {
+      put(group, pageNumber, group?.vendorName || group?.vendorNorm || "", "group");
+    }
+  }
+
+  return Array.from(byPage.values()).sort((a, b) => (a.page || 0) - (b.page || 0));
+}
 // Normalize an output stem so it follows <Vendor Name>_<InvoiceNumber>.
 // - Vendor keeps SPACES (no underscores between words)
 // - Separator between vendor and invoice is a SINGLE underscore
@@ -396,6 +430,229 @@ function cleanVendorForStem(vendorNormLike) {
 }
 
 
+function normalizeVendorKey(value) {
+  return String(value || "")
+    .toUpperCase()
+    .replace(/&/g, " AND ")
+    .replace(/[^A-Z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function collectTextBits(value, out = []) {
+  if (value == null) return out;
+  if (typeof value === "string" || typeof value === "number") {
+    const s = String(value).trim();
+    if (s) out.push(s);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) collectTextBits(v, out);
+    return out;
+  }
+  if (typeof value === "object") {
+    for (const v of Object.values(value)) collectTextBits(v, out);
+  }
+  return out;
+}
+
+function pageCandidateText(pageLike) {
+  const preferred = [
+    pageLike?.vendorName,
+    pageLike?.vendorNorm,
+    pageLike?.ocrText,
+    pageLike?.text,
+    pageLike?.rawText,
+    pageLike?.pageText,
+    pageLike?.fullText,
+    pageLike?.headerText,
+    pageLike?.topText,
+    pageLike?.topThirdText,
+    pageLike?.lines,
+    pageLike?.blocks
+  ];
+
+  const extra = [];
+  if (pageLike && typeof pageLike === "object") {
+    for (const [k, v] of Object.entries(pageLike)) {
+      if (/vendor|invoice|pageindex|pages?$/i.test(k)) continue;
+      collectTextBits(v, extra);
+    }
+  }
+
+  return [...collectTextBits(preferred), ...extra].join("\n").trim();
+}
+
+const VENDOR_BAD_LINE_PATTERNS = [
+  /\binvoice\b/i,
+  /\binvoice\s*(number|no|#)\b/i,
+  /\bstatement\b/i,
+  /\bbill\s+to\b/i,
+  /\bship\s+to\b/i,
+  /\bremit\b/i,
+  /\bamount\s+due\b/i,
+  /\btotal\b/i,
+  /\bdate\b/i,
+  /\bterms\b/i,
+  /\bpage\s+\d+\b/i,
+  /\bpo\s*(number|#)?\b/i,
+  /@/,
+  /\bwww\./i,
+  /\bhttps?:\/\//i,
+  /\d{3}[-.\s]\d{3}[-.\s]\d{4}/,
+  /\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b/,
+  /^\$?\d[\d,]*\.\d{2}$/
+];
+
+function looksLikeVendorLine(line) {
+  const s = String(line || "").replace(/\s+/g, " ").trim();
+  if (!s) return false;
+  if (s.length < 4 || s.length > 80) return false;
+  if (VENDOR_BAD_LINE_PATTERNS.some((rx) => rx.test(s))) return false;
+  if (/^\d+$/.test(s)) return false;
+  if (/^\d+\s+[A-Z]/i.test(s)) return false;
+  const words = s.split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 8) return false;
+  const alphaCount = (s.match(/[A-Za-z]/g) || []).length;
+  if (alphaCount < 4) return false;
+  return true;
+}
+
+function vendorFromText(text) {
+  const raw = String(text || "");
+  if (!raw) return "";
+
+  for (const vendor of KNOWN_VENDOR_PATTERNS) {
+    if (vendor.patterns.some((rx) => rx.test(raw))) return vendor.name;
+  }
+
+  const lines = raw
+    .split(/\r?\n/g)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 16);
+
+  for (const line of lines) {
+    if (!looksLikeVendorLine(line)) continue;
+    const cleaned = line
+      .replace(/^from\s+/i, "")
+      .replace(/^vendor\s*[:\-]\s*/i, "")
+      .replace(/[|]+/g, " ")
+      .trim();
+    const canonical = canonicalVendorName(cleaned);
+    if (canonical && normalizeVendorKey(canonical) !== "UNKNOWN VENDOR") return canonical;
+  }
+
+  return "";
+}
+
+function resolveVendorName(pageLike, fallback = "") {
+  const direct = canonicalVendorName(
+    pageLike?.VENDORNAME || pageLike?.vendorName || pageLike?.vendorNorm || pageLike?.vendor || fallback || ""
+  );
+  if (direct && normalizeVendorKey(direct) !== "UNKNOWN VENDOR") return direct;
+
+  const candidates = [
+    pageLike?.vendorRaw,
+    pageLike?.matchedFrom,
+    pageLike?.vendorMatchedFrom,
+    pageLike?.headerText,
+    pageLike?.topText,
+    pageLike?.ocrText,
+    fallback
+  ]
+    .map((v) => String(v || "").trim())
+    .filter(Boolean);
+
+  for (const candidate of candidates) {
+    const canonical = canonicalVendorName(candidate);
+    if (canonical && normalizeVendorKey(canonical) !== "UNKNOWN VENDOR") {
+      return canonical;
+    }
+
+    const normalized = normalizeVendorKey(candidate);
+
+    if (/\bWWW\s+CLASINFO\b/.test(normalized) || /\bCLASINFO\b/.test(normalized) || /\bCLAS\b/.test(normalized)) {
+      return "Clas Information Services";
+    }
+
+    if (/\bRASI[\s_]+NCSI\b/.test(normalized)) {
+      return "Rasi_NCSI";
+    }
+
+    if (/\bDOC[\s-]*U[\s-]*SEARCH\b/.test(normalized)) {
+      return "Doc-U-Search";
+    }
+  }
+
+  return canonicalVendorName(fallback || "") || "Unknown Vendor";
+}
+  // existing fallback logic continues...
+
+const KNOWN_VENDOR_PATTERNS = [
+  {
+    name: "PST Abstracting, Inc.",
+    patterns: [/\bPST\s+ABSTRACT/i, /\bPST\b.*\bINC\b/i]
+  },
+  {
+    name: "CT Filing & Search Services, LLC",
+    patterns: [/\bCT\s+FILING\b/i, /\bSEARCH\s+SERVICES\b.*\bLLC\b/i]
+  },
+  {
+    name: "CLAS Information Services",
+    patterns: [/\bCLAS\s+INFORMATION\s+SERVICES\b/i, /\bCLAS\b.*\bINFORMATION\b/i]
+  },
+  {
+    name: "United Corporate Services, Inc.",
+    patterns: [/\bUNITED\s+CORPORATE\s+SERVICES\b/i, /\bUCS\b.*\bCORPORATE\b/i]
+  },
+  {
+    name: "Pioneer Corporate Services",
+    patterns: [/\bPIONEER\s+CORPORATE\s+SERVICES\b/i, /\bPIONEER\b.*\bCORPORATE\b/i]
+  }
+];
+
+function canonicalVendorName(raw) {
+  const key = normalizeVendorKey(raw);
+  if (!key) return "";
+
+  for (const vendor of KNOWN_VENDOR_PATTERNS) {
+    if (vendor.patterns.some((rx) => rx.test(key))) return vendor.name;
+  }
+
+  return toVendorDisplayName(raw);
+}
+
+function extractVendorNamesFromItem(item) {
+  const seen = new Set();
+  const out = [];
+
+  const addVendor = (pageLike, pageIndex, fallback = "") => {
+    const name = resolveVendorName(pageLike, fallback);
+    if (!name || /^unknown vendor$/i.test(name)) return;
+    const k = `${pageIndex || "?"}__${name}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push({
+      page: Number(pageIndex) || null,
+      name
+    });
+  };
+
+  for (const page of item?.plan?.pages || []) {
+    addVendor(page, page?.pageIndex, page?.vendorName || page?.vendorNorm || "");
+  }
+
+  if (!out.length) {
+    for (const group of item?.groups || []) {
+      const firstPage = Array.isArray(group?.pages) ? group.pages[0] : null;
+      addVendor(group, firstPage, group?.vendorName || group?.vendorNorm || "");
+    }
+  }
+
+  return out.sort((a, b) => (a.page || 0) - (b.page || 0));
+}
+
 function defaultStem(vendorNorm, invoiceNumber) {
   // Guard against common header labels accidentally being detected as vendor.
   const isBadVendorLabel = (s) => {
@@ -590,6 +847,11 @@ export default function App() {
     [batchJobId, items, busy]
   );
 
+const vendorResults = useMemo(
+  () => items.map((it) => ({ jobId: it.jobId, sourceName: it.sourceName, vendors: extractPageVendorNamesFromItem(it) })),
+  [items]
+);
+
   const openPicker = () => fileInputRef.current?.click();
 
   const reset = () => {
@@ -615,40 +877,48 @@ export default function App() {
 
 
   const listenProgress = (jid, opts = {}) => {
-    const setter = typeof opts?.setState === 'function' ? opts.setState : setProgress;
-    const onDone = typeof opts?.onDone === 'function' ? opts.onDone : null;
-    const onError = typeof opts?.onError === 'function' ? opts.onError : null;
+    const setter = typeof opts?.setState === "function" ? opts.setState : setProgress;
+    const onDone = typeof opts?.onDone === "function" ? opts.onDone : null;
+    const onError = typeof opts?.onError === "function" ? opts.onError : null;
 
-    try {
-      const es = new EventSource('/api/progress/' + encodeURIComponent(jid));
-      es.onmessage = (evt) => {
+    const ctl = { stopped: false };
+
+    (async function pollProgress() {
+      while (!ctl.stopped) {
         try {
-          const data = JSON.parse(evt.data);
-          setter(data);
+          const r = await fetch(`/api/progress/${encodeURIComponent(jid)}?once=1&t=${Date.now()}`, {
+            cache: "no-store"
+          });
+
+          if (!r.ok) {
+            throw new Error(`Progress request failed (${r.status})`);
+          }
+
+          const data = await r.json().catch(() => null);
+          if (data) setter(data);
+
           if (data?.done) {
-            es.close();
+            ctl.stopped = true;
             try {
               onDone?.(data);
             } catch {}
+            break;
           }
-        } catch {}
-      };
-      es.onerror = () => {
-        try {
-          es.close();
-        } catch {}
-        try {
-          onError?.();
-        } catch {}
-      };
-      return () => {
-        try {
-          es.close();
-        } catch {}
-      };
-    } catch {
-      return null;
-    }
+        } catch (err) {
+          ctl.stopped = true;
+          try {
+            onError?.(err);
+          } catch {}
+          break;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 700));
+      }
+    })();
+
+    return () => {
+      ctl.stopped = true;
+    };
   };
 
 
@@ -927,13 +1197,18 @@ const resplitFileToSingles = (fileIdx) => {
     prev.map((it, i) => {
       if (i !== fileIdx) return it;
       const pages = it.plan?.pages || [];
-      const groups = pages.map((p, idx) => ({
-        groupIndex: idx + 1,
-        vendorNorm: p.vendorNorm || "UNKNOWN_VENDOR",
-        invoiceNumber: p.invoiceNumber || "",
-        pages: [p.pageIndex],
-        suggestedStem: defaultStem(p.vendorNorm || "UNKNOWN_VENDOR", p.invoiceNumber || "")
-      }));
+const groups = pages.map((p, idx) => {
+const vendorNorm =
+  resolveVendorName(g, g.VENDORNAME || g.vendorNorm || g.vendorName || "") ||
+  g.VENDORNAME ||
+  g.vendorNorm ||
+  "UNKNOWN_VENDOR";
+    return {
+    groupIndex: idx + 1,
+    vendorNorm: resolvedVendor || p.vendorNorm || "UNKNOWN_VENDOR",
+    // rest unchanged
+  };
+});
       return { ...it, groups: dedupeStems(groups) };
     })
   );
@@ -946,11 +1221,11 @@ const splitGroupIntoSingles = (fileIdx, groupIdx) => {
       const groups = Array.isArray(it.groups) ? [...it.groups] : [];
       const g = groups[groupIdx];
       if (!g || !Array.isArray(g.pages) || g.pages.length < 2) return it;
-      const vendorNorm = g.vendorNorm || "UNKNOWN_VENDOR";
+      const vendorNorm = resolveVendorName(g, g.vendorNorm || g.vendorName || "") || g.vendorNorm || "UNKNOWN_VENDOR";
       const invoiceNumber = g.invoiceNumber || "";
       const [p1, p2] = g.pages;
-      const g1 = { ...g, pages: [p1], suggestedStem: defaultStem(vendorNorm, invoiceNumber) };
-      const g2 = { ...g, pages: [p2], suggestedStem: defaultStem(vendorNorm, invoiceNumber) };
+      const g1 = { ...g, vendorNorm, pages: [p1], suggestedStem: defaultStem(vendorNorm, invoiceNumber) };
+      const g2 = { ...g, vendorNorm, pages: [p2], suggestedStem: defaultStem(vendorNorm, invoiceNumber) };
       groups.splice(groupIdx, 1, g1, g2);
       return { ...it, groups: dedupeStems(groups) };
     })
@@ -1093,6 +1368,26 @@ const splitGroupIntoSingles = (fileIdx, groupIdx) => {
         )}
 
         {error && <div className="error">Error: {error}</div>}
+
+        {vendorResults.some((it) => it.vendors.length > 0) && (
+          <div className="card" style={{ marginTop: 16 }}>
+            <div style={{ fontWeight: 800, fontSize: 16 }}>Detected Vendors</div>
+            <div className="small" style={{ marginTop: 6 }}>
+              These vendor names are generated from the analyzed invoice data using repeatable pattern matching, so the same vendor names can be surfaced again on future uploads.
+            </div>
+
+            {vendorResults.map((it) =>
+              it.vendors.length ? (
+                <div key={`vendors_${it.jobId}`} style={{ marginTop: 12 }}>
+                  <div style={{ fontWeight: 700 }}>{it.sourceName}</div>
+                  <div className="small" style={{ marginTop: 6 }}>
+                    {it.vendors.map((v) => `p.${v.page || "?"}: ${v.name}`).join(" • ")}
+                  </div>
+                </div>
+              ) : null
+            )}
+          </div>
+        )}
 
         {items.length > 0 && (
           <div className="footer">

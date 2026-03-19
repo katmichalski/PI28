@@ -3,35 +3,25 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { createWorker } from "tesseract.js";
 
-/**
- * Shared Tesseract worker + a simple sequential queue.
- *
- * Why:
- * - Creating a new worker per request is slow and memory-heavy.
- * - Running multiple recognizes concurrently can spike memory.
- */
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SERVER_ROOT = path.resolve(__dirname, "..");
 
-function firstExisting(paths) {
-  for (const p of paths) {
-    try {
-      if (p && fs.existsSync(p)) return p;
-    } catch {}
-  }
-  return null;
+function toPositiveInt(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const LOCAL_LANG_DIR = process.env.TESSERACT_LANG_PATH || path.join(SERVER_ROOT, "tessdata");
-
-// If local tessdata isn't present, fall back to a remote tessdata host.
-// This keeps OCR working for users who haven't downloaded eng.traineddata yet.
-// You can override or disable by setting TESSERACT_REMOTE_LANG_PATH="".
 const DEFAULT_REMOTE_LANG_PATH = "https://tessdata.projectnaptha.com/4.0.0_fast";
 const REMOTE_LANG_PATH =
-  process.env.TESSERACT_REMOTE_LANG_PATH === "" ? null : (process.env.TESSERACT_REMOTE_LANG_PATH || DEFAULT_REMOTE_LANG_PATH);
+  process.env.TESSERACT_REMOTE_LANG_PATH === ""
+    ? null
+    : (process.env.TESSERACT_REMOTE_LANG_PATH || DEFAULT_REMOTE_LANG_PATH);
 
 function hasLocalEng(dir) {
   try {
@@ -41,21 +31,22 @@ function hasLocalEng(dir) {
   }
 }
 
-const EFFECTIVE_LANG_PATH = hasLocalEng(LOCAL_LANG_DIR) ? LOCAL_LANG_DIR : (REMOTE_LANG_PATH || LOCAL_LANG_DIR);
+const USING_LOCAL_ENG = hasLocalEng(LOCAL_LANG_DIR);
+const EFFECTIVE_LANG_PATH = USING_LOCAL_ENG ? LOCAL_LANG_DIR : (REMOTE_LANG_PATH || LOCAL_LANG_DIR);
 
-// If neither local nor remote is usable, fail fast with a clear message.
 function assertLangAvailable() {
-  if (hasLocalEng(LOCAL_LANG_DIR)) return;
+  if (USING_LOCAL_ENG) return;
   if (REMOTE_LANG_PATH) return;
   throw new Error(
     "Tesseract language data missing: server/tessdata/eng.traineddata. " +
-      "Run server/scripts/download-eng-tessdata.ps1 (Windows) or download eng.traineddata into server/tessdata."
+      "Put eng.traineddata into server/tessdata or set TESSERACT_REMOTE_LANG_PATH."
   );
 }
 
-// Avoid a hung worker initialization (can happen if language downloads are blocked).
-// Keep this fairly short so the UI can surface a clear warning instead of looking stuck.
-const WORKER_INIT_TIMEOUT_MS = Number(process.env.TESSERACT_WORKER_INIT_TIMEOUT_MS || 30000);
+const WORKER_INIT_TIMEOUT_MS = toPositiveInt(process.env.TESSERACT_WORKER_INIT_TIMEOUT_MS, 120000);
+const WORKER_INIT_RETRIES = toPositiveInt(process.env.TESSERACT_WORKER_INIT_RETRIES, 1);
+const WORKER_RETRY_DELAY_MS = toPositiveInt(process.env.TESSERACT_WORKER_RETRY_DELAY_MS, 1500);
+const WORKER_IDLE_TERMINATE_MS = toPositiveInt(process.env.TESSERACT_WORKER_IDLE_TERMINATE_MS, 10 * 60 * 1000);
 
 function withTimeout(promise, ms, label) {
   if (!ms || ms <= 0) return promise;
@@ -66,9 +57,6 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
 }
 
-// IMPORTANT (tesseract.js v5+): corePath should be a DIRECTORY that contains all 4 builds
-// (wasm, wasm+simd, lstm, lstm+simd). Setting corePath to a single file can be much slower.
-// See: tesseract.js docs (performance/local-installation).
 const REQUIRED_CORE_FILES = [
   "tesseract-core.wasm.js",
   "tesseract-core-simd.wasm.js",
@@ -96,6 +84,7 @@ function findCoreDir() {
     path.resolve(SERVER_ROOT, "..", "node_modules", "tesseract.js-core"),
     path.resolve(SERVER_ROOT, "..", "..", "node_modules", "tesseract.js-core")
   ];
+
   for (const c of candidates) {
     if (hasAllCoreFiles(c)) return c;
   }
@@ -104,87 +93,152 @@ function findCoreDir() {
 
 const CORE_DIR = findCoreDir();
 
-const WORKER_PATH =
-  process.env.TESSERACT_WORKER_PATH ||
-  firstExisting([
-    path.join(SERVER_ROOT, "node_modules", "tesseract.js", "dist", "worker.min.js"),
-    path.join(SERVER_ROOT, "node_modules", "tesseract.js", "dist", "worker.js"),
-    path.resolve(SERVER_ROOT, "..", "node_modules", "tesseract.js", "dist", "worker.min.js"),
-    path.resolve(SERVER_ROOT, "..", "node_modules", "tesseract.js", "dist", "worker.js")
-  ]);
-
 let workerPromise = null;
+let workerInstance = null;
 let queue = Promise.resolve();
+let idleTimer = null;
+let lastUsedAt = 0;
+
+function clearIdleTimer() {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+function clearWorkerRefs() {
+  workerPromise = null;
+  workerInstance = null;
+  clearIdleTimer();
+}
+
+async function safelyTerminate(worker) {
+  try {
+    if (worker) await worker.terminate();
+  } catch {}
+}
+
+function markWorkerUsed() {
+  lastUsedAt = Date.now();
+  clearIdleTimer();
+
+  if (!WORKER_IDLE_TERMINATE_MS || WORKER_IDLE_TERMINATE_MS <= 0) return;
+
+  idleTimer = setTimeout(async () => {
+    const idleFor = Date.now() - lastUsedAt;
+    if (idleFor < WORKER_IDLE_TERMINATE_MS) return;
+    await terminateWorker();
+  }, WORKER_IDLE_TERMINATE_MS + 50);
+}
+
+function buildInitError(err, attempt, timeoutMs) {
+  const base = String(err?.message || err || "Unknown Tesseract initialization error");
+  const remoteNote = !USING_LOCAL_ENG && REMOTE_LANG_PATH
+    ? ` Local eng.traineddata was not found, so OCR is using remote language data (${EFFECTIVE_LANG_PATH}).`
+    : "";
+
+  return new Error(
+    `Tesseract worker init failed on attempt ${attempt + 1}/${WORKER_INIT_RETRIES + 1} ` +
+      `(timeout ${timeoutMs}ms). ${base}.${remoteNote}`
+  );
+}
+
+async function createWorkerOnce(timeoutMs) {
+  const options = {
+    langPath: EFFECTIVE_LANG_PATH,
+    corePath: CORE_DIR || undefined,
+    logger: () => {},
+    gzip: USING_LOCAL_ENG ? false : true
+  };
+
+  const worker = await withTimeout(
+    createWorker("eng", 1, options),
+    timeoutMs,
+    "tesseract worker init"
+  );
+
+  await worker.setParameters({
+    tessedit_pageseg_mode: "6"
+  });
+
+  workerInstance = worker;
+  markWorkerUsed();
+  return worker;
+}
+
+async function initializeWorker() {
+  assertLangAvailable();
+
+  let lastError;
+
+  for (let attempt = 0; attempt <= WORKER_INIT_RETRIES; attempt++) {
+    const timeoutMs = WORKER_INIT_TIMEOUT_MS * (attempt + 1);
+    try {
+      return await createWorkerOnce(timeoutMs);
+    } catch (err) {
+      lastError = buildInitError(err, attempt, timeoutMs);
+      await safelyTerminate(workerInstance);
+      workerInstance = null;
+
+      if (attempt < WORKER_INIT_RETRIES) {
+        await sleep(WORKER_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+  }
+
+  throw lastError;
+}
 
 async function getWorker() {
   if (workerPromise) return workerPromise;
 
-  workerPromise = (async () => {
-    assertLangAvailable();
-
-    // tesseract.js v5+: recommended signature is createWorker(langs, oem, options)
-    // so the worker is ready without separate loadLanguage/initialize calls.
-    const worker = await withTimeout(
-      createWorker("eng", 1, {
-        // Prefer local assets to avoid HTTPS download failures on locked-down networks.
-        // If local tessdata isn't present, we fall back to a remote tessdata host.
-        langPath: EFFECTIVE_LANG_PATH,
-        corePath: CORE_DIR || undefined,
-        workerPath: WORKER_PATH || undefined,
-        logger: () => {}
-      }),
-      WORKER_INIT_TIMEOUT_MS,
-      "tesseract worker init"
-    );
-
-    // Reasonable defaults for invoices
-    await worker.setParameters({
-      tessedit_pageseg_mode: "6" // Assume a uniform block of text
-    });
-
-    return worker;
-  })();
+  workerPromise = initializeWorker().catch((err) => {
+    clearWorkerRefs();
+    throw err;
+  });
 
   return workerPromise;
-}
-
-export function getTessdataStatus() {
-  return {
-    localEng: hasLocalEng(LOCAL_LANG_DIR),
-    effectiveLangPath: EFFECTIVE_LANG_PATH,
-    usingRemote: !hasLocalEng(LOCAL_LANG_DIR) && Boolean(REMOTE_LANG_PATH)
-  };
 }
 
 function normalizeText(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-/**
- * OCR a PNG buffer.
- * @param {Buffer|Uint8Array} pngBuffer
- * @param {{psm?: string|number, whitelist?: string}} opts
- */
+async function runRecognize(pngBuffer, opts = {}) {
+  const worker = await getWorker();
+
+  const params = {};
+  if (opts.psm != null) params.tessedit_pageseg_mode = String(opts.psm);
+  if (opts.whitelist) params.tessedit_char_whitelist = String(opts.whitelist);
+  if (Object.keys(params).length) {
+    await worker.setParameters(params);
+  }
+
+  markWorkerUsed();
+  const result = await worker.recognize(pngBuffer);
+  const raw = result?.data?.text || "";
+  markWorkerUsed();
+
+  return {
+    text: normalizeText(raw),
+    raw
+  };
+}
+
 export async function recognizePng(pngBuffer, opts = {}) {
   const run = async () => {
-    const worker = await getWorker();
+    try {
+      return await runRecognize(pngBuffer, opts);
+    } catch (err) {
+      const msg = String(err?.message || err || "");
+      const looksRecoverable = /timed out|terminated|worker|network|fetch|load|EPIPE|ECONN|ENOENT/i.test(msg);
+      if (!looksRecoverable) throw err;
 
-    const params = {};
-    if (opts.psm != null) params.tessedit_pageseg_mode = String(opts.psm);
-    if (opts.whitelist) params.tessedit_char_whitelist = String(opts.whitelist);
-    if (Object.keys(params).length) {
-      await worker.setParameters(params);
+      await terminateWorker();
+      return await runRecognize(pngBuffer, opts);
     }
-
-    const result = await worker.recognize(pngBuffer);
-    const raw = result?.data?.text || "";
-    return {
-      text: normalizeText(raw),
-      raw
-    };
   };
 
-  // Simple mutex: chain onto the queue so calls run sequentially.
   const p = queue.then(run, run);
   queue = p.then(
     () => {},
@@ -193,11 +247,29 @@ export async function recognizePng(pngBuffer, opts = {}) {
   return p;
 }
 
+export function getTessdataStatus() {
+  return {
+    localEng: USING_LOCAL_ENG,
+    effectiveLangPath: EFFECTIVE_LANG_PATH,
+    usingRemote: !USING_LOCAL_ENG && Boolean(REMOTE_LANG_PATH),
+    workerInitTimeoutMs: WORKER_INIT_TIMEOUT_MS,
+    workerInitRetries: WORKER_INIT_RETRIES,
+    workerRetryDelayMs: WORKER_RETRY_DELAY_MS,
+    workerIdleTerminateMs: WORKER_IDLE_TERMINATE_MS,
+    coreDir: CORE_DIR || null,
+    workerPath: null
+  };
+}
+
+export async function warmTesseractWorker() {
+  const worker = await getWorker();
+  markWorkerUsed();
+  return Boolean(worker);
+}
+
 export async function terminateWorker() {
-  try {
-    const w = await workerPromise;
-    if (w) await w.terminate();
-  } catch {}
-  workerPromise = null;
+  const w = workerInstance;
+  clearWorkerRefs();
   queue = Promise.resolve();
+  await safelyTerminate(w);
 }

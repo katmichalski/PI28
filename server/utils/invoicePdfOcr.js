@@ -1,406 +1,396 @@
-import { loadVendorIndex } from "./vendorStore.js";
-import { findInvoiceNumber, findVendor } from "./detect.js";
-import { getTopThirdTextRegions, ocrTopThirdRegions, ocrTopThirdVendorHintsLightGrey, ocrLogoTextFromPdfPage, ocrPdfPageAddressHints } from "./imageRegionOcr.js";
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
 
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
+const execFileAsync = promisify(execFile);
+const PDFTOPPM_BIN = process.env.PDFTOPPM_BIN || "pdftoppm";
+const TESSERACT_BIN = process.env.TESSERACT_BIN || "tesseract";
+
+async function run(bin, args) {
+  try {
+    const { stdout } = await execFileAsync(bin, args, {
+      maxBuffer: 20 * 1024 * 1024,
+      windowsHide: true
+    });
+    return stdout;
+  } catch (err) {
+    const detail = String(err?.stderr || err?.message || err);
+    throw new Error(`${bin} failed: ${detail}`);
+  }
 }
 
-/**
- * Extract vendor + invoice number from a specific PDF page.
- *
- * Strategy:
- * 1) If the PDF already has a text layer (native PDF or OCRmyPDF output), use that (very fast).
- * 2) Otherwise render+OCR only the minimal header regions (vendor + right side).
- * 3) If still missing, OCR the additional header regions (middle/left) as a fallback.
- */
-export async function extractInvoiceFieldsFromPdfPage({ pdfPath, pageNumber }) {
-  const vendorIndex = loadVendorIndex();
-
-  // Keep any invoice number we find early so we can skip redundant OCR later.
-  let invoiceNumber = "";
-  let vendor = null;
-  let logoDebug = null;
-
-  // 1) Fast path: existing PDF text layer
-  const textRegions = await getTopThirdTextRegions({ pdfPath, pageNumber });
-  if (textRegions?.hasText) {
-        const headerRightText = textRegions.aboveTableRightText || textRegions.topRightText;
-    const headerMiddleText = textRegions.aboveTableMiddleText || textRegions.topMiddleText;
-    const headerLeftText = textRegions.aboveTableLeftText || textRegions.topLeftText;
-    const headerVendorText = textRegions.aboveTableVendorText || textRegions.topVendorText;
-    const headerVendorBoldText = textRegions.aboveTableVendorBoldText || textRegions.topVendorBoldText;
-    const headerLeftBoldText = textRegions.aboveTableLeftBoldText || textRegions.topLeftBoldText;
-    const headerMiddleBoldText = textRegions.aboveTableMiddleBoldText || textRegions.topMiddleBoldText;
-    const headerRightBoldText = textRegions.aboveTableRightBoldText || textRegions.topRightBoldText;
-
-    // Reading-order header text (top-left -> top-right, then down), preferring "above table".
-    const headerFullReadingText = textRegions.aboveTableFullText || textRegions.topFullText || textRegions.fullTopText || "";
-    const headerFullReadingBoldText = textRegions.aboveTableFullBoldText || "";
-
-    // Keep the old concatenation as a fallback, but prefer the reading-order text.
-    // Legacy concatenation fallback: keep LEFT->MIDDLE->RIGHT order first so we follow
-    // top-left -> top-right before continuing downward.
-    const headerFullTextLegacy = [headerLeftText, headerMiddleText, headerRightText, headerVendorText]
+async function loadVendorNamesFromXlsx(xlsxPath) {
+  if (!xlsxPath) return [];
+  try {
+    const xlsx = await import("xlsx");
+    const workbook = xlsx.readFile(xlsxPath);
+    const firstSheet = workbook.SheetNames?.[0];
+    const sheet = firstSheet ? workbook.Sheets[firstSheet] : null;
+    const rows = sheet ? xlsx.utils.sheet_to_json(sheet, { header: 1, defval: "" }) : [];
+    return rows
+      .flatMap((row) => (Array.isArray(row) ? row : []))
+      .map((value) => String(value || "").trim())
       .filter(Boolean)
-      .join("\n");
-    const headerFullText = headerFullReadingText || headerFullTextLegacy || textRegions.fullTopText;
-
-    invoiceNumber = findInvoiceNumber({
-      right: headerRightText,
-      middle: headerMiddleText,
-      left: headerLeftText,
-      full: headerFullText || textRegions.fullTopText
-    });
-
-    vendor = findVendor(
-  {
-    topVendorText: headerVendorText,
-    topVendorBoldText: headerVendorBoldText,
-    topLeftText: headerLeftText,
-    topLeftBoldText: headerLeftBoldText,
-    topMiddleText: headerMiddleText,
-    topMiddleBoldText: headerMiddleBoldText,
-    topRightText: headerRightText,
-    topRightBoldText: headerRightBoldText,
-    topFullText: headerFullText,
-    topFullBoldText: headerFullReadingBoldText,
-    full: headerFullText || textRegions.fullTopText,
-    // Provide full-page text (when available) for address-based vendor overrides.
-    fullRaw: textRegions.fullPageText || headerFullText || textRegions.fullTopText
-  },
-  vendorIndex
-);
-
-    // If we got a vendor, return immediately (text layer is best).
-    if (vendor?.vendorNorm && vendor.vendorNorm !== "UNKNOWN_VENDOR") {
-      const invDigits = (String(invoiceNumber || "").match(/\d/g) || []).length;
-      const invoiceConf = clamp((invDigits / 8) * 0.7 + (invoiceNumber ? 0.3 : 0), 0, 1);
-      const vendorConf = vendor?.matched
-        ? 0.95
-        : vendor?.vendorNorm && vendor.vendorNorm !== "UNKNOWN_VENDOR"
-          ? 0.65
-          : 0.0;
-
-      return {
-        pageIndex: pageNumber,
-        vendorRaw: vendor?.vendorRaw || "UNKNOWN_VENDOR",
-        vendorNorm: vendor?.vendorNorm || "UNKNOWN_VENDOR",
-        vendorMatched: !!vendor?.matched,
-        vendorConfidence: Number(vendorConf.toFixed(3)),
-        invoiceNumber: invoiceNumber || "",
-        invoiceConfidence: Number(invoiceConf.toFixed(3)),
-        debug: {
-          source: "pdf_text",
-          topVendorText: headerVendorText,
-          topLeftText: headerLeftText,
-          topMiddleText: headerMiddleText,
-          topRightText: headerRightText,
-          topFullText: headerFullText
-        }
-      };
-    }
+      .filter((value, index, arr) => arr.indexOf(value) === index);
+  } catch {
+    return [];
   }
-  // 2) Image OCR fast path: START TOP-LEFT (vendor) + TOP-RIGHT (invoice #)
-  //    This reduces false vendor matches from mid-page tables and follows your rule to start at the top-left.
-  const fastLeft = await ocrTopThirdRegions({
+}
+
+function normalizeVendorText(value) {
+  return String(value || "")
+    .toUpperCase()
+    .replace(/&/g, " AND ")
+    .replace(/[^A-Z0-9]+/g, " ")
+    .replace(/\b(THE|INCORPORATED|INC|LLC|LTD|LIMITED|CO|COMPANY|CORP|CORPORATION|SERVICES|SERVICE|GROUP|PA|PC|PLLC)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildVendorAliases(name) {
+  const raw = String(name || "").trim();
+  const aliases = new Set([raw, normalizeVendorText(raw)]);
+
+  if (/\bCLAS\b|\bCLASINFO\b|CLAS INFORMATION/i.test(raw)) {
+    aliases.add("CLAS");
+    aliases.add("CLASINFO");
+    aliases.add("WWW CLASINFO");
+    aliases.add("CLAS INFORMATION SERVICES");
+  }
+
+  if (/RASI_NCSI/i.test(raw)) aliases.add("RASI NCSI");
+  if (/DOC-U-SEARCH/i.test(raw)) aliases.add(raw.replace(/-/g, " "));
+
+  return Array.from(aliases).map(normalizeVendorText).filter(Boolean);
+}
+
+function buildVendorCatalog(vendorNames) {
+  return (Array.isArray(vendorNames) ? vendorNames : [])
+    .map((name) => String(name || "").trim())
+    .filter(Boolean)
+    .map((name) => ({
+      canonical: name,
+      aliases: buildVendorAliases(name)
+    }));
+}
+
+async function renderPdfPageToPng(pdfPath, pageNumber) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "invoice-ocr-"));
+  const prefix = path.join(dir, "page");
+
+  await run(PDFTOPPM_BIN, [
+    "-f", String(pageNumber),
+    "-l", String(pageNumber),
+    "-png",
+    "-r", "220",
     pdfPath,
-    pageNumber,
-    needLeft: true,
-    needMiddle: false,
-    needRight: !invoiceNumber,
-    needVendor: false
-  });
-
-  if (!invoiceNumber) {
-    invoiceNumber = findInvoiceNumber({
-      right: fastLeft.topRightText,
-      middle: "",
-      left: fastLeft.topLeftText,
-      full: `${fastLeft.topLeftText}
-${fastLeft.topRightText}`
-    });
-  }
-
-  vendor = findVendor(
-    {
-      topLeftText: fastLeft.topLeftText,
-      topRightText: fastLeft.topRightText,
-      full: fastLeft.topLeftText
-    },
-    vendorIndex
-  );
-
-  // If vendor might be in the top-right (or spans the full header), take a full-width header OCR pass.
-  // This enforces the reading-order rule: left -> right, then down.
-  let fastFull = null;
-  if (!vendor?.vendorNorm || vendor.vendorNorm === "UNKNOWN_VENDOR") {
-    fastFull = await ocrTopThirdRegions({
-      pdfPath,
-      pageNumber,
-      needLeft: false,
-      needMiddle: false,
-      needRight: false,
-      needVendor: false,
-      needFull: true
-    });
-
-    const vFull = findVendor(
-      {
-        topFullText: fastFull.topFullText,
-        topLeftText: fastLeft.topLeftText,
-        topRightText: fastLeft.topRightText,
-        full: fastFull.topFullText || `${fastLeft.topLeftText}\n${fastLeft.topRightText}`
-      },
-      vendorIndex
-    );
-
-    if (vFull?.vendorNorm && vFull.vendorNorm !== "UNKNOWN_VENDOR") vendor = vFull;
-  }
-
-  // If the vendor is printed in light grey, a targeted light-grey OCR pass often recovers it.
-  if (!vendor?.vendorNorm || vendor.vendorNorm === "UNKNOWN_VENDOR") {
-    try {
-      const light = await ocrTopThirdVendorHintsLightGrey({
-        pdfPath,
-        pageNumber,
-        needLeft: true,
-        needVendor: false,
-        needFull: true
-      });
-
-      const vLight = findVendor(
-        {
-          topLeftText: light.topLeftText,
-          topFullText: light.topFullText,
-          full: light.topFullText || `${light.topLeftText}\n${fastLeft.topLeftText}`
-        },
-        vendorIndex
-      );
-
-      if (vLight?.vendorNorm && vLight.vendorNorm !== "UNKNOWN_VENDOR") {
-        vendor = vLight;
-        const invDigits = (String(invoiceNumber || "").match(/\d/g) || []).length;
-        const invoiceConf = clamp((invDigits / 8) * 0.7 + (invoiceNumber ? 0.3 : 0), 0, 1);
-        const vendorConf = vendor?.matched ? 0.95 : 0.65;
-
-        return {
-          pageIndex: pageNumber,
-          vendorRaw: vendor?.vendorRaw || "UNKNOWN_VENDOR",
-          vendorNorm: vendor?.vendorNorm || "UNKNOWN_VENDOR",
-          vendorMatched: !!vendor?.matched,
-          vendorConfidence: Number(vendorConf.toFixed(3)),
-          invoiceNumber: invoiceNumber || "",
-          invoiceConfidence: Number(invoiceConf.toFixed(3)),
-          debug: {
-            source: "image_ocr_light_left",
-            topVendorText: "",
-            topLeftText: light.topLeftText,
-            topMiddleText: "",
-            topRightText: fastLeft.topRightText,
-            topFullText: light.topFullText || ""
-          }
-        };
-      }
-    } catch {
-      // ignore light-grey OCR failures
-    }
-  }
-
-  // If vendor is still UNKNOWN, widen to the full top-left + top-middle header band (left 2/3).
-  let fastWide = null;
-  if (!vendor?.vendorNorm || vendor.vendorNorm === "UNKNOWN_VENDOR") {
-    fastWide = await ocrTopThirdRegions({
-      pdfPath,
-      pageNumber,
-      needLeft: false,
-      needMiddle: false,
-      needRight: false,
-      needVendor: true
-    });
-
-    vendor = findVendor(
-      {
-        topVendorText: fastWide.topVendorText,
-        topLeftText: fastLeft.topLeftText,
-        topRightText: fastLeft.topRightText,
-        topFullText: fastFull?.topFullText || "",
-        full: `${fastWide.topVendorText}
-${fastLeft.topLeftText}`
-      },
-      vendorIndex
-    );
-
-    // If still unknown, try a light-grey enhanced OCR pass for the wide vendor band.
-    if (!vendor?.vendorNorm || vendor.vendorNorm === "UNKNOWN_VENDOR") {
-      try {
-        const light = await ocrTopThirdVendorHintsLightGrey({
-          pdfPath,
-          pageNumber,
-          needLeft: false,
-          needVendor: true,
-          needFull: true
-        });
-        const vLight = findVendor(
-          {
-            topVendorText: light.topVendorText,
-            topLeftText: fastLeft.topLeftText,
-            topRightText: fastLeft.topRightText,
-            topFullText: light.topFullText,
-            full: `${light.topVendorText}\n${fastLeft.topLeftText}`
-          },
-          vendorIndex
-        );
-        if (vLight?.vendorNorm && vLight.vendorNorm !== "UNKNOWN_VENDOR") vendor = vLight;
-      } catch {
-        // ignore light-grey OCR failures
-      }
-    }
-  }
-
-  // If we got a vendor (and invoice number maybe), return immediately.
-  if (vendor?.vendorNorm && vendor.vendorNorm !== "UNKNOWN_VENDOR") {
-    const invDigits = (String(invoiceNumber || "").match(/\d/g) || []).length;
-    const invoiceConf = clamp((invDigits / 8) * 0.7 + (invoiceNumber ? 0.3 : 0), 0, 1);
-    const vendorConf = vendor?.matched ? 0.95 : 0.65;
-
-    return {
-      pageIndex: pageNumber,
-      vendorRaw: vendor?.vendorRaw || "UNKNOWN_VENDOR",
-      vendorNorm: vendor?.vendorNorm || "UNKNOWN_VENDOR",
-      vendorMatched: !!vendor?.matched,
-      vendorConfidence: Number(vendorConf.toFixed(3)),
-      invoiceNumber: invoiceNumber || "",
-      invoiceConfidence: Number(invoiceConf.toFixed(3)),
-      debug: {
-        source: fastWide ? "image_ocr_fast_wide" : "image_ocr_fast_left",
-        topVendorText: fastWide?.topVendorText || "",
-        topLeftText: fastLeft.topLeftText,
-        topMiddleText: "",
-        topRightText: fastLeft.topRightText
-      }
-    };
-  }
-
-  // 3) Fallback: OCR all header regions (4 OCR calls)
-  const regions = await ocrTopThirdRegions({ pdfPath, pageNumber, needFull: true });
-
-  if (!invoiceNumber) {
-    invoiceNumber = findInvoiceNumber({
-      right: regions.topRightText,
-      middle: regions.topMiddleText,
-      left: regions.topLeftText,
-      full: `${regions.topVendorText}\n${regions.topLeftText}\n${regions.topMiddleText}\n${regions.topRightText}`
-    });
-  }
-
-  vendor = findVendor(
-    {
-      topVendorText: regions.topVendorText,
-      topLeftText: regions.topLeftText,
-      topMiddleText: regions.topMiddleText,
-      topRightText: regions.topRightText,
-      topFullText: regions.topFullText,
-      full: regions.topFullText || `${regions.topVendorText}\n${regions.topLeftText}\n${regions.topMiddleText}\n${regions.topRightText}`
-    },
-    vendorIndex
-  );
-
-  // If still unknown, try light-grey enhanced header OCR before logo OCR.
-  if (!vendor?.vendorNorm || vendor.vendorNorm === "UNKNOWN_VENDOR") {
-    try {
-      const light = await ocrTopThirdVendorHintsLightGrey({ pdfPath, pageNumber, needLeft: true, needVendor: true });
-      const vLight = findVendor(
-        {
-          topVendorText: light.topVendorText || regions.topVendorText,
-          topLeftText: light.topLeftText || regions.topLeftText,
-          topMiddleText: regions.topMiddleText,
-          topRightText: regions.topRightText,
-          topFullText: light.topFullText || regions.topFullText,
-          full: (light.topFullText || regions.topFullText) || `${light.topVendorText}\n${light.topLeftText}\n${regions.topMiddleText}\n${regions.topRightText}`
-        },
-        vendorIndex
-      );
-      if (vLight?.vendorNorm && vLight.vendorNorm !== "UNKNOWN_VENDOR") vendor = vLight;
-    } catch {
-      // ignore light-grey OCR failures
-    }
-  }
-
-  // 4) LAST RESORT: OCR logo regions before returning UNKNOWN_VENDOR.
-  if (!vendor?.vendorNorm || vendor.vendorNorm === "UNKNOWN_VENDOR") {
-    try {
-      const logo = await ocrLogoTextFromPdfPage({ pdfPath, pageNumber });
-      logoDebug = logo;
-      const v2 = findVendor({ topVendorText: logo.bestText, full: logo.bestText }, vendorIndex);
-      if (v2?.vendorNorm && v2.vendorNorm !== "UNKNOWN_VENDOR") vendor = v2;
-    } catch {
-      // ignore logo OCR failures
-    }
-  }
-
-  // 5) LAST-LAST RESORT: If vendor is still UNKNOWN, OCR below-header content to
-  // trigger address-based overrides (e.g., remit-to blocks that appear below line items).
-  if (!vendor?.vendorNorm || vendor.vendorNorm === "UNKNOWN_VENDOR") {
-    try {
-      const addressText = await ocrPdfPageAddressHints({ pdfPath, pageNumber });
-      if (addressText && addressText.trim()) {
-        const vAddr = findVendor(
-          {
-            // Keep header text for context, but keep "full" empty so we don't
-            // accidentally pick an address line as a vendor.
-            topFullText: regions?.topFullText || fastFull?.topFullText || "",
-            topLeftText: regions?.topLeftText || fastLeft?.topLeftText || "",
-            full: "",
-            fullRaw: addressText
-          },
-          vendorIndex
-        );
-        if (vAddr?.vendorNorm && vAddr.vendorNorm !== "UNKNOWN_VENDOR") vendor = vAddr;
-      }
-    } catch {
-      // ignore address OCR failures
-    }
-  }
-
-  // Lightweight confidence proxies
-  const invDigits = (String(invoiceNumber || "").match(/\d/g) || []).length;
-  const invoiceConf = clamp((invDigits / 8) * 0.7 + (invoiceNumber ? 0.3 : 0), 0, 1);
-  const vendorConf = vendor?.matched
-    ? 0.95
-    : vendor?.vendorNorm && vendor.vendorNorm !== "UNKNOWN_VENDOR"
-      ? 0.65
-      : 0.0;
+    prefix
+  ]);
 
   return {
-    pageIndex: pageNumber,
-    vendorRaw: vendor?.vendorRaw || "UNKNOWN_VENDOR",
-    vendorNorm: vendor?.vendorNorm || "UNKNOWN_VENDOR",
-    vendorMatched: !!vendor?.matched,
-    vendorConfidence: Number(vendorConf.toFixed(3)),
-    invoiceNumber: invoiceNumber || "",
-    invoiceConfidence: Number(invoiceConf.toFixed(3)),
-    debug: {
-      source: "image_ocr_full",
-      topVendorText: regions.topVendorText,
-      topLeftText: regions.topLeftText,
-      topMiddleText: regions.topMiddleText,
-      topRightText: regions.topRightText,
-      logoBestText: logoDebug?.bestText || "",
-      logoTopLeftText: logoDebug?.topLeftText || "",
-      logoTopCenterText: logoDebug?.topCenterText || "",
-      logoTopRightText: logoDebug?.topRightText || ""
-    }
+    dir,
+    imagePath: `${prefix}-${pageNumber}.png`
   };
 }
 
-/**
- * Batch variant: extract fields for multiple pages (sequential to keep memory stable).
- */
-export async function extractInvoiceFieldsFromPdfPages({ pdfPath, pageNumbers }) {
-  const out = [];
-  for (const p of pageNumbers || []) {
-    out.push(await extractInvoiceFieldsFromPdfPage({ pdfPath, pageNumber: p }));
+function parseTsv(tsv) {
+  const lines = String(tsv || "").split(/\r?\n/).filter(Boolean);
+  const header = lines.shift();
+  if (!header) return [];
+
+  const cols = header.split("\t");
+  return lines
+    .map((line) => {
+      const parts = line.split("\t");
+      const row = {};
+      cols.forEach((col, index) => {
+        row[col] = parts[index] ?? "";
+      });
+      return {
+        level: Number(row.level || 0),
+        page_num: Number(row.page_num || 0),
+        block_num: Number(row.block_num || 0),
+        par_num: Number(row.par_num || 0),
+        line_num: Number(row.line_num || 0),
+        word_num: Number(row.word_num || 0),
+        left: Number(row.left || 0),
+        top: Number(row.top || 0),
+        width: Number(row.width || 0),
+        height: Number(row.height || 0),
+        conf: Number(row.conf || -1),
+        text: String(row.text || "").trim()
+      };
+    })
+    .filter((row) => row.level === 5 && row.text);
+}
+
+function groupWordsIntoLines(words) {
+  const buckets = new Map();
+
+  for (const word of words) {
+    const key = `${word.page_num}:${word.block_num}:${word.par_num}:${word.line_num}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(word);
   }
-  return out;
+
+  return Array.from(buckets.values())
+    .map((lineWords) => {
+      const sorted = lineWords.sort((a, b) => a.left - b.left);
+      const left = Math.min(...sorted.map((w) => w.left));
+      const top = Math.min(...sorted.map((w) => w.top));
+      const right = Math.max(...sorted.map((w) => w.left + w.width));
+      const bottom = Math.max(...sorted.map((w) => w.top + w.height));
+      return {
+        text: sorted.map((w) => w.text).join(" ").replace(/\s+/g, " ").trim(),
+        words: sorted,
+        left,
+        top,
+        width: right - left,
+        height: bottom - top,
+        right,
+        bottom
+      };
+    })
+    .filter((line) => line.text)
+    .sort((a, b) => (a.top - b.top) || (a.left - b.left));
+}
+
+async function ocrPage(imagePath) {
+  const [rawText, rawTsv] = await Promise.all([
+    run(TESSERACT_BIN, [imagePath, "stdout", "--psm", "6"]),
+    run(TESSERACT_BIN, [imagePath, "stdout", "--psm", "6", "tsv"])
+  ]);
+
+  const words = parseTsv(rawTsv);
+  const lines = groupWordsIntoLines(words);
+  const pageWidth = Math.max(1, ...words.map((w) => w.left + w.width));
+  const pageHeight = Math.max(1, ...words.map((w) => w.top + w.height));
+
+  return {
+    text: String(rawText || "").replace(/\r/g, "").trim(),
+    words,
+    lines,
+    pageWidth,
+    pageHeight
+  };
+}
+
+function isNoiseLine(text) {
+  const s = String(text || "").trim();
+  if (!s) return true;
+  if (/^(date|due date|terms|bill to|ship to|debtor|account|attention|phone|tel|fax|email|www|http|qty|item|description|rate|county|amount|balance due|total)\b/i.test(s)) return true;
+  if (/[@]|\b(road|rd\.?|street|st\.?|avenue|ave\.?|suite|ste\.?|box|po box)\b/i.test(s)) return true;
+  if (/^\d+[\d\s\-\/.,]*$/.test(s)) return true;
+  return false;
+}
+
+function scoreVendorCandidateText(candidate, catalog) {
+  const normalized = normalizeVendorText(candidate);
+  if (!normalized) return null;
+
+  let best = null;
+  for (const entry of catalog) {
+    let score = 0;
+
+    for (const alias of entry.aliases) {
+      if (normalized === alias) score = Math.max(score, 1000 + alias.length);
+      else if (normalized.includes(alias)) score = Math.max(score, 800 + alias.length);
+      else {
+        const cTokens = new Set(normalized.split(/\s+/));
+        const aTokens = alias.split(/\s+/);
+        const overlap = aTokens.filter((t) => cTokens.has(t)).length;
+        const ratio = overlap / Math.max(1, aTokens.length);
+        if (overlap >= 2 && ratio >= 0.66) score = Math.max(score, Math.round(ratio * 100));
+      }
+    }
+
+    if (score > 0 && (!best || score > best.score)) {
+      best = { vendorName: entry.canonical, score, matchedFrom: candidate };
+    }
+  }
+
+  return best;
+}
+
+function extractVendorName(lines, pageWidth, pageHeight, vendorCatalog) {
+  const topLines = lines.filter((line) => line.top <= pageHeight * 0.18);
+  const vendorZone = topLines.filter((line) => line.left <= pageWidth * 0.75);
+
+  let bestMatch = null;
+  const windows = [];
+  for (let i = 0; i < vendorZone.length; i += 1) {
+    windows.push({ text: vendorZone[i].text, top: vendorZone[i].top });
+    if (vendorZone[i + 1]) {
+      windows.push({
+        text: `${vendorZone[i].text} ${vendorZone[i + 1].text}`,
+        top: vendorZone[i].top
+      });
+    }
+  }
+
+  for (const candidate of windows) {
+    const matched = scoreVendorCandidateText(candidate.text, vendorCatalog);
+    if (
+      matched &&
+      (
+        !bestMatch ||
+        matched.score > bestMatch.score ||
+        (matched.score === bestMatch.score && candidate.top < bestMatch.top)
+      )
+    ) {
+      bestMatch = { ...matched, top: candidate.top };
+    }
+  }
+
+  if (bestMatch) {
+    return {
+      vendorName: bestMatch.vendorName,
+      score: bestMatch.score,
+      matchedFrom: bestMatch.matchedFrom
+    };
+  }
+
+  const fallback = vendorZone.find((line) => {
+    const cleaned = line.text.replace(/\bINVOICE\b.*$/i, "").trim();
+    return cleaned && !isNoiseLine(cleaned);
+  });
+
+  if (fallback) {
+    const cleaned = fallback.text.replace(/\bINVOICE\b.*$/i, "").trim();
+    return {
+      vendorName: cleaned || "UNKNOWN_VENDOR",
+      score: 10,
+      matchedFrom: fallback.text
+    };
+  }
+
+  return { vendorName: "UNKNOWN_VENDOR", score: 0, matchedFrom: "" };
+}
+
+function cleanInvoiceNumber(value) {
+  return String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]+/g, "")
+    .replace(/^-+|-+$/g, "");
+}
+
+function pickBestHashNumber(text) {
+  const hits = [...String(text || "").matchAll(/#\s*([A-Z0-9-]{4,})/gi)]
+    .map((m) => cleanInvoiceNumber(m[1]));
+  return hits.length ? hits[hits.length - 1] : "";
+}
+
+function extractInvoiceNumber(lines, pageWidth, pageHeight) {
+  const topLines = lines.filter((line) => line.top <= pageHeight * 0.4);
+  const rightOrLabeledLines = topLines.filter(
+    (line) =>
+      line.left >= pageWidth * 0.45 ||
+      /invoice|inv\b|ref\b|project\b|order\/item/i.test(line.text)
+  );
+
+  const labelRegex =
+    /\b(?:invoice(?:\s*(?:number|no\.?|num|#))?|inv\.?|ref\.?|project\s*#?|order\/item\s*#?)\b[^A-Z0-9\n\r]{0,20}[#:\s-]*([A-Z0-9-]{3,})\b/i;
+
+  for (let i = 0; i < rightOrLabeledLines.length; i += 1) {
+    const prev = rightOrLabeledLines[i - 1]?.text || "";
+    const curr = rightOrLabeledLines[i].text || "";
+    const next = rightOrLabeledLines[i + 1]?.text || "";
+    const next2 = rightOrLabeledLines[i + 2]?.text || "";
+    const windows = [curr, `${curr} ${next}`, `${prev} ${curr}`, `${curr} ${next} ${next2}`];
+
+    for (const sample of windows) {
+      const direct = sample.match(labelRegex);
+      if (direct?.[1] && !/^PAG?E?$/i.test(direct[1])) {
+        return cleanInvoiceNumber(direct[1]);
+      }
+
+      if (/invoice|inv\b/i.test(curr)) {
+        const hashed = pickBestHashNumber(sample);
+        if (hashed) return hashed;
+      }
+    }
+  }
+
+  const invoiceLines = topLines.filter((line) => /invoice|inv\b/i.test(line.text));
+  for (const line of invoiceLines) {
+    const idx = topLines.findIndex((item) => item === line);
+    const window = [
+      topLines[idx - 1]?.text || "",
+      topLines[idx]?.text || "",
+      topLines[idx + 1]?.text || "",
+      topLines[idx + 2]?.text || ""
+    ].join(" ");
+
+    const direct = window.match(labelRegex);
+    if (direct?.[1] && !/^PAG?E?$/i.test(direct[1])) {
+      return cleanInvoiceNumber(direct[1]);
+    }
+
+    const hashed = pickBestHashNumber(window);
+    if (hashed) return hashed;
+  }
+
+  const joined = topLines.map((line) => line.text).join(" \n ");
+  const direct = joined.match(labelRegex);
+  if (direct?.[1] && !/^PAG?E?$/i.test(direct[1])) {
+    return cleanInvoiceNumber(direct[1]);
+  }
+
+  return pickBestHashNumber(joined);
+}
+
+export async function extractInvoiceFieldsFromPdfPage({
+  pdfPath,
+  pageNumber,
+  vendorNames = [],
+  vendorXlsxPath = ""
+}) {
+  const loadedVendorNames = vendorNames.length
+    ? vendorNames
+    : await loadVendorNamesFromXlsx(vendorXlsxPath);
+
+  const vendorCatalog = buildVendorCatalog(loadedVendorNames);
+
+  const { dir, imagePath } = await renderPdfPageToPng(pdfPath, pageNumber);
+
+  try {
+    const { text, lines, pageWidth, pageHeight } = await ocrPage(imagePath);
+    const vendor = extractVendorName(lines, pageWidth, pageHeight, vendorCatalog);
+    const invoiceNumber = extractInvoiceNumber(lines, pageWidth, pageHeight);
+
+    return {
+      pageNumber,
+      text,
+      words: text.split(/\s+/).filter(Boolean),
+      vendorName: vendor.vendorName || "UNKNOWN_VENDOR",
+      vendorMatchedFrom: vendor.matchedFrom || "",
+      vendorScore: vendor.score || 0,
+      invoiceNumber: invoiceNumber || "",
+      rawLines: lines.map((line) => line.text)
+    };
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+export async function extractInvoiceFieldsFromPdfPages({
+  pdfPath,
+  pageNumbers,
+  vendorNames = [],
+  vendorXlsxPath = ""
+}) {
+  const results = [];
+  for (const pageNumber of pageNumbers || []) {
+    results.push(
+      await extractInvoiceFieldsFromPdfPage({
+        pdfPath,
+        pageNumber,
+        vendorNames,
+        vendorXlsxPath
+      })
+    );
+  }
+  return results;
 }
