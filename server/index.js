@@ -236,47 +236,197 @@ function getKnownVendorEntries() {
   return dedupeByNormalized(entries);
 }
 
-function scoreVendorAgainstText(vendorName, normalizedText, textTokenSet) {
+const GENERIC_VENDOR_TOKENS = new Set([
+  "THE",
+  "AND",
+  "OF",
+  "INC",
+  "INCORPORATED",
+  "LLC",
+  "L_L_C",
+  "CO",
+  "COMPANY",
+  "CORP",
+  "CORPORATION",
+  "SERVICES",
+  "SERVICE",
+  "GROUP",
+  "HOLDINGS",
+  "HOLDING",
+  "LIMITED",
+  "LTD",
+  "PLC",
+  "LP",
+  "LLP",
+  "USA",
+  "US",
+]);
+
+function isLastResortVendor(normalizedVendor) {
+  return (
+    normalizedVendor === "UNITED_CORPORATE_SERVICES" ||
+    normalizedVendor.startsWith("UNITED_CORPORATE_SERVICES_")
+  );
+}
+
+function getTopOfPageText(pageText) {
+  return String(pageText || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 8)
+    .join("\n");
+}
+
+function extractBillToBlock(pageText) {
+  const lines = String(pageText || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim());
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!line) continue;
+
+    if (/^bill\s*to\b/i.test(line) || /^bill-to\b/i.test(line)) {
+      const block = [];
+
+      for (let j = i; j < Math.min(lines.length, i + 8); j += 1) {
+        const nextLine = lines[j]?.trim();
+        if (!nextLine) continue;
+        block.push(nextLine);
+      }
+
+      return block.join("\n");
+    }
+  }
+
+  return "";
+}
+
+function isUnitedCorporateServicesInBillTo(pageText) {
+  const billToBlock = extractBillToBlock(pageText);
+  if (!billToBlock) return false;
+
+  const normalizedBillTo = normalizeVendorName(billToBlock);
+  return normalizedBillTo.includes("UNITED_CORPORATE_SERVICES");
+}
+
+function getMeaningfulVendorTokens(vendorName) {
+  const allTokens = tokenizeNormalized(vendorName);
+
+  const filtered = allTokens.filter(
+    (token) => token.length >= 2 && !GENERIC_VENDOR_TOKENS.has(token)
+  );
+
+  return filtered.length ? filtered : allTokens;
+}
+
+function scoreVendorAgainstText(
+  vendorName,
+  normalizedText,
+  textTokenSet,
+  topNormalizedText,
+  topTokenSet
+) {
   const normalizedVendor = normalizeVendorName(vendorName);
   if (!normalizedVendor) return 0;
 
-  if (normalizedText.includes(normalizedVendor)) {
-    return 1000 + normalizedVendor.length;
+  const meaningfulTokens = getMeaningfulVendorTokens(normalizedVendor);
+  if (!meaningfulTokens.length) return 0;
+
+  const fullMatchInTop = topNormalizedText.includes(normalizedVendor);
+  const fullMatchAnywhere = normalizedText.includes(normalizedVendor);
+
+  let topHits = 0;
+  let pageHits = 0;
+
+  for (const token of meaningfulTokens) {
+    if (topTokenSet.has(token)) topHits += 1;
+    if (textTokenSet.has(token)) pageHits += 1;
   }
 
-  const vendorTokens = tokenizeNormalized(normalizedVendor);
-  if (!vendorTokens.length) return 0;
+  const topRatio = topHits / meaningfulTokens.length;
+  const pageRatio = pageHits / meaningfulTokens.length;
 
-  let hits = 0;
-  for (const token of vendorTokens) {
-    if (textTokenSet.has(token)) hits += 1;
+  let score = 0;
+
+  if (fullMatchInTop) {
+    score += 2500 + normalizedVendor.length;
+  } else if (fullMatchAnywhere) {
+    score += 1800 + normalizedVendor.length;
   }
 
-  const ratio = hits / vendorTokens.length;
+  if (topRatio === 1) {
+    score += 1200 + meaningfulTokens.length * 20;
+  } else if (topRatio >= 0.75) {
+    score += 700 + topHits * 25;
+  } else if (topRatio >= 0.5) {
+    score += 300 + topHits * 20;
+  }
 
-  if (ratio === 1) return 500 + vendorTokens.length;
-  if (ratio >= 0.75) return 200 + hits;
-  if (ratio >= 0.5 && vendorTokens.length >= 3) return 100 + hits;
+  if (pageRatio === 1) {
+    score += 600 + meaningfulTokens.length * 15;
+  } else if (pageRatio >= 0.75) {
+    score += 300 + pageHits * 15;
+  } else if (pageRatio >= 0.5 && meaningfulTokens.length >= 2) {
+    score += 120 + pageHits * 10;
+  }
 
-  return 0;
+  if (isLastResortVendor(normalizedVendor)) {
+    if (fullMatchInTop) return 90;
+    if (fullMatchAnywhere) return 60;
+    if (topRatio >= 0.75) return 40;
+    if (pageRatio >= 0.75) return 25;
+    return 1;
+  }
+
+  return score;
 }
 
 function findBestVendorMatch(pageText, vendorEntries) {
-  const normalizedText = normalizeVendorName(pageText || "");
-  const textTokenSet = new Set(tokenizeNormalized(normalizedText));
+  const sourceText = String(pageText || "");
+  const normalizedText = normalizeVendorName(sourceText);
+  const topOfPageText = getTopOfPageText(sourceText);
+  const topNormalizedText = normalizeVendorName(topOfPageText);
 
-  let best = {
+  const textTokenSet = new Set(tokenizeNormalized(normalizedText));
+  const topTokenSet = new Set(tokenizeNormalized(topNormalizedText));
+
+  const unitedCorporateServicesInBillTo =
+    isUnitedCorporateServicesInBillTo(sourceText);
+
+  const regularEntries = [];
+  const fallbackEntries = [];
+
+  for (const entry of vendorEntries) {
+    const normalizedVendor = normalizeVendorName(entry?.vendorName || "");
+    if (!normalizedVendor) continue;
+
+    if (isLastResortVendor(normalizedVendor)) {
+      fallbackEntries.push(entry);
+    } else {
+      regularEntries.push(entry);
+    }
+  }
+
+  let bestRegular = {
     vendorName: "UNKNOWN_VENDOR",
     normalizedVendor: "UNKNOWN_VENDOR",
     score: 0,
   };
 
-  for (const entry of vendorEntries) {
+  for (const entry of regularEntries) {
     const vendorName = entry.vendorName;
-    const score = scoreVendorAgainstText(vendorName, normalizedText, textTokenSet);
+    const score = scoreVendorAgainstText(
+      vendorName,
+      normalizedText,
+      textTokenSet,
+      topNormalizedText,
+      topTokenSet
+    );
 
-    if (score > best.score) {
-      best = {
+    if (score > bestRegular.score) {
+      bestRegular = {
         vendorName,
         normalizedVendor: normalizeVendorName(vendorName),
         score,
@@ -284,7 +434,67 @@ function findBestVendorMatch(pageText, vendorEntries) {
     }
   }
 
-  return best;
+  if (bestRegular.score >= 120) {
+    return bestRegular;
+  }
+
+  let bestFallback = {
+    vendorName: "UNKNOWN_VENDOR",
+    normalizedVendor: "UNKNOWN_VENDOR",
+    score: 0,
+  };
+
+  for (const entry of fallbackEntries) {
+    const vendorName = entry.vendorName;
+    const normalizedVendor = normalizeVendorName(vendorName);
+
+    if (
+      unitedCorporateServicesInBillTo &&
+      isLastResortVendor(normalizedVendor)
+    ) {
+      continue;
+    }
+
+    const score = scoreVendorAgainstText(
+      vendorName,
+      normalizedText,
+      textTokenSet,
+      topNormalizedText,
+      topTokenSet
+    );
+
+    if (score > bestFallback.score) {
+      bestFallback = {
+        vendorName,
+        normalizedVendor,
+        score,
+      };
+    }
+  }
+
+  if (bestRegular.score > 0 && bestRegular.score >= bestFallback.score) {
+    return bestRegular;
+  }
+
+  if (bestFallback.score > 0) {
+    return bestFallback;
+  }
+
+  if (unitedCorporateServicesInBillTo) {
+    return {
+      vendorName: "UNKNOWN_VENDOR",
+      normalizedVendor: "UNKNOWN_VENDOR",
+      score: 0,
+    };
+  }
+
+  return bestRegular.score > 0
+    ? bestRegular
+    : {
+        vendorName: "UNKNOWN_VENDOR",
+        normalizedVendor: "UNKNOWN_VENDOR",
+        score: 0,
+      };
 }
 
 function extractInvoiceNumber(text) {

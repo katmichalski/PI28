@@ -36,6 +36,56 @@ async function parseJsonSafe(res) {
   }
 }
 
+function parseJsonTextSafe(text) {
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
+
+function postFormDataWithProgress(
+  url,
+  formData,
+  { onUploadProgress, onUploadComplete } = {}
+) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.responseType = "text";
+
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      const percent = Math.round((event.loaded / event.total) * 100);
+      onUploadProgress?.(percent);
+    };
+
+    xhr.upload.onload = () => {
+      onUploadComplete?.();
+    };
+
+    xhr.onload = () => {
+      resolve({
+        ok: xhr.status >= 200 && xhr.status < 300,
+        status: xhr.status,
+        text: xhr.responseText,
+        getHeader: (name) => xhr.getResponseHeader(name),
+      });
+    };
+
+    xhr.onerror = () => {
+      reject(new Error(`Network error calling ${url}.`));
+    };
+
+    xhr.onabort = () => {
+      reject(new Error(`Request aborted calling ${url}.`));
+    };
+
+    xhr.send(formData);
+  });
+}
+
 function getFileNameFromDisposition(disposition) {
   if (!disposition) return "";
 
@@ -64,6 +114,32 @@ function formatBytes(bytes) {
   }
 
   return `${value.toFixed(value >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function normalizeVendorNameForFile(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/&/g, " AND ")
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function sanitizeFilePart(value, fallback) {
+  const clean = String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  return clean || fallback;
+}
+
+function makeOfficialFileName(vendorName, invoiceNumber) {
+  const vendorPart =
+    normalizeVendorNameForFile(vendorName || "UNKNOWN_VENDOR") || "UNKNOWN_VENDOR";
+  const invoicePart = sanitizeFilePart(invoiceNumber, "UNKNOWN_INVOICE");
+  return `${vendorPart}_${invoicePart}.pdf`;
 }
 
 function StatusPill({ children, tone = "info" }) {
@@ -110,7 +186,63 @@ function StatusPill({ children, tone = "info" }) {
   );
 }
 
-function ResultPreviewPanel({ row, onDownload }) {
+function ProgressBar({ visible, percent, label }) {
+  if (!visible) return null;
+
+  return (
+    <div
+      style={{
+        marginTop: 16,
+        borderRadius: 14,
+        padding: 14,
+        background: "rgba(9, 19, 29, 0.88)",
+        border: "1px solid rgba(90, 143, 191, 0.22)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 12,
+          alignItems: "center",
+          marginBottom: 10,
+          flexWrap: "wrap",
+        }}
+      >
+        <div style={{ color: "#d7eeff", fontWeight: 800 }}>
+          {label || "Working..."}
+        </div>
+        <div style={{ color: "#9fc3df", fontWeight: 800 }}>
+          {Math.max(0, Math.min(100, Math.round(percent || 0)))}%
+        </div>
+      </div>
+
+      <div
+        style={{
+          width: "100%",
+          height: 12,
+          borderRadius: 999,
+          overflow: "hidden",
+          background: "rgba(255,255,255,0.08)",
+          border: "1px solid rgba(110, 166, 214, 0.2)",
+        }}
+      >
+        <div
+          style={{
+            width: `${Math.max(0, Math.min(100, percent || 0))}%`,
+            height: "100%",
+            borderRadius: 999,
+            background:
+              "linear-gradient(90deg, rgba(61,145,207,1) 0%, rgba(122,197,255,1) 100%)",
+            transition: "width 180ms ease",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ResultPreviewPanel({ row, onDownload, onEdit }) {
   if (!row) {
     return (
       <div
@@ -235,7 +367,30 @@ function ResultPreviewPanel({ row, onDownload }) {
         </div>
       </div>
 
-      <div style={{ marginTop: 14 }}>
+      <div
+        style={{
+          marginTop: 14,
+          display: "flex",
+          gap: 10,
+          flexWrap: "wrap",
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => onEdit?.(row)}
+          style={{
+            padding: "12px 16px",
+            borderRadius: 12,
+            border: "1px solid rgba(110, 166, 214, 0.35)",
+            background: "#174060",
+            color: "#f4fbff",
+            cursor: "pointer",
+            fontWeight: 800,
+          }}
+        >
+          Edit Vendor / Invoice
+        </button>
+
         <button
           type="button"
           onClick={() => onDownload?.(row)}
@@ -280,6 +435,167 @@ function ResultPreviewPanel({ row, onDownload }) {
           </div>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function EditRowModal({
+  isOpen,
+  vendorName,
+  invoiceNumber,
+  onVendorChange,
+  onInvoiceChange,
+  onClose,
+  onSave,
+}) {
+  if (!isOpen) return null;
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0, 0, 0, 0.6)",
+        display: "grid",
+        placeItems: "center",
+        zIndex: 9999,
+        padding: 20,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "100%",
+          maxWidth: 560,
+          borderRadius: 20,
+          padding: 20,
+          background: "#0b1824",
+          border: "1px solid rgba(85, 140, 190, 0.24)",
+          boxShadow: "0 24px 70px rgba(0, 0, 0, 0.4)",
+        }}
+      >
+        <div style={{ color: "#eef8ff", fontSize: 24, fontWeight: 900 }}>
+          Edit Row
+        </div>
+        <div style={{ color: "#9fc3df", marginTop: 6, lineHeight: 1.6 }}>
+          Update the vendor name or invoice number for this page.
+        </div>
+
+        <div style={{ marginTop: 18 }}>
+          <label
+            style={{
+              display: "block",
+              color: "#d7eeff",
+              fontWeight: 800,
+              marginBottom: 8,
+            }}
+          >
+            Vendor
+          </label>
+          <input
+            value={vendorName}
+            onChange={(e) => onVendorChange(e.target.value)}
+            placeholder="Enter vendor name"
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              padding: "12px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(110, 166, 214, 0.35)",
+              background: "#0f2232",
+              color: "#eef8ff",
+              outline: "none",
+            }}
+          />
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <label
+            style={{
+              display: "block",
+              color: "#d7eeff",
+              fontWeight: 800,
+              marginBottom: 8,
+            }}
+          >
+            Invoice Number
+          </label>
+          <input
+            value={invoiceNumber}
+            onChange={(e) => onInvoiceChange(e.target.value)}
+            placeholder="Enter invoice number"
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              padding: "12px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(110, 166, 214, 0.35)",
+              background: "#0f2232",
+              color: "#eef8ff",
+              outline: "none",
+            }}
+          />
+        </div>
+
+        <div
+          style={{
+            marginTop: 16,
+            borderRadius: 12,
+            padding: 12,
+            background: "#0d2233",
+            border: "1px solid rgba(85, 140, 190, 0.2)",
+          }}
+        >
+          <div style={{ color: "#d7eeff", fontWeight: 800, marginBottom: 6 }}>
+            New Official File Name
+          </div>
+          <div style={{ color: "#cbe6fb", wordBreak: "break-word" }}>
+            {makeOfficialFileName(vendorName, invoiceNumber)}
+          </div>
+        </div>
+
+        <div
+          style={{
+            marginTop: 18,
+            display: "flex",
+            gap: 10,
+            flexWrap: "wrap",
+          }}
+        >
+          <button
+            type="button"
+            onClick={onSave}
+            style={{
+              padding: "12px 16px",
+              borderRadius: 12,
+              border: "1px solid rgba(110, 166, 214, 0.35)",
+              background: "#1d6fa5",
+              color: "#f4fbff",
+              cursor: "pointer",
+              fontWeight: 800,
+            }}
+          >
+            Save Changes
+          </button>
+
+          <button
+            type="button"
+            onClick={onClose}
+            style={{
+              padding: "12px 16px",
+              borderRadius: 12,
+              border: "1px solid rgba(110, 166, 214, 0.35)",
+              background: "#0f2538",
+              color: "#e5f4ff",
+              cursor: "pointer",
+              fontWeight: 700,
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -888,6 +1204,17 @@ export default function App() {
   const [newVendorReviews, setNewVendorReviews] = useState([]);
   const [statusMessage, setStatusMessage] = useState("");
 
+  const [editingRowIndex, setEditingRowIndex] = useState(null);
+  const [editVendorName, setEditVendorName] = useState("");
+  const [editInvoiceNumber, setEditInvoiceNumber] = useState("");
+
+  const [progressVisible, setProgressVisible] = useState(false);
+  const [progressPercent, setProgressPercent] = useState(0);
+  const [progressLabel, setProgressLabel] = useState("");
+
+  const progressTimerRef = useRef(null);
+  const progressHideTimerRef = useRef(null);
+
   useEffect(() => {
     let cancelled = false;
     const controller = new AbortController();
@@ -949,10 +1276,68 @@ export default function App() {
     }
   }, [results.length, selectedResultIndex]);
 
+  useEffect(() => {
+    return () => {
+      clearProgressTimers();
+    };
+  }, []);
+
   const selectedResult = useMemo(() => {
     if (!results.length) return null;
     return results[selectedResultIndex] || results[0] || null;
   }, [results, selectedResultIndex]);
+
+  const isEditModalOpen =
+    editingRowIndex !== null &&
+    editingRowIndex >= 0 &&
+    editingRowIndex < results.length;
+
+  function clearProgressTimers() {
+    if (progressTimerRef.current) {
+      window.clearInterval(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
+
+    if (progressHideTimerRef.current) {
+      window.clearTimeout(progressHideTimerRef.current);
+      progressHideTimerRef.current = null;
+    }
+  }
+
+  function beginProgress(label) {
+    clearProgressTimers();
+    setProgressVisible(true);
+    setProgressPercent(0);
+    setProgressLabel(label || "Starting...");
+  }
+
+  function startProcessingTail(label, floor = 72, cap = 95) {
+    clearProgressTimers();
+    setProgressVisible(true);
+    setProgressLabel(label || "Processing...");
+    setProgressPercent((prev) => Math.max(prev, floor));
+
+    progressTimerRef.current = window.setInterval(() => {
+      setProgressPercent((prev) => {
+        if (prev >= cap) return prev;
+        if (prev < 85) return prev + 2;
+        return prev + 1;
+      });
+    }, 250);
+  }
+
+  function finishProgress(label) {
+    clearProgressTimers();
+    setProgressVisible(true);
+    setProgressLabel(label || "Done");
+    setProgressPercent(100);
+
+    progressHideTimerRef.current = window.setTimeout(() => {
+      setProgressVisible(false);
+      setProgressPercent(0);
+      setProgressLabel("");
+    }, 700);
+  }
 
   function handleChooseFile() {
     fileInputRef.current?.click();
@@ -984,6 +1369,68 @@ export default function App() {
     handleFiles(e.dataTransfer?.files);
   }
 
+  function openEditModalByIndex(index) {
+    const row = results[index];
+    if (!row) return;
+
+    setEditingRowIndex(index);
+    setEditVendorName(row.vendorName || "");
+    setEditInvoiceNumber(row.invoiceNumber || "");
+  }
+
+  function openEditModalForRow(row) {
+    const index = results.findIndex(
+      (item) => Number(item.pageNumber) === Number(row?.pageNumber)
+    );
+    if (index < 0) return;
+    openEditModalByIndex(index);
+  }
+
+  function closeEditModal() {
+    setEditingRowIndex(null);
+    setEditVendorName("");
+    setEditInvoiceNumber("");
+  }
+
+  function saveEditModal() {
+    if (editingRowIndex === null) return;
+
+    const vendorName = String(editVendorName || "").trim() || "UNKNOWN_VENDOR";
+    const invoiceNumber = String(editInvoiceNumber || "").trim();
+    const officialFileName = makeOfficialFileName(vendorName, invoiceNumber);
+
+    setResults((prev) =>
+      prev.map((item, index) => {
+        if (index !== editingRowIndex) return item;
+
+        return {
+          ...item,
+          vendorName,
+          normalizedVendor: normalizeVendorNameForFile(vendorName),
+          invoiceNumber,
+          officialFileName,
+        };
+      })
+    );
+
+    setNewVendorReviews((prev) =>
+      prev.map((item) => {
+        const matchesPage =
+          Number(item.pageNumber) === Number(results[editingRowIndex]?.pageNumber);
+
+        if (!matchesPage) return item;
+
+        return {
+          ...item,
+          suggestedVendorName: vendorName,
+        };
+      })
+    );
+
+    setStatusMessage(`Updated page ${results[editingRowIndex]?.pageNumber || ""}.`);
+    closeEditModal();
+  }
+
   async function handlePlan() {
     if (!selectedFile) {
       window.alert("Choose a PDF first.");
@@ -993,16 +1440,24 @@ export default function App() {
     try {
       setPlanning(true);
       setStatusMessage("Uploading file and analyzing pages...");
+      beginProgress("Uploading file...");
 
       const formData = new FormData();
       formData.append("file", selectedFile);
 
-      const res = await fetch("/api/plan", {
-        method: "POST",
-        body: formData,
+      const res = await postFormDataWithProgress("/api/plan", formData, {
+        onUploadProgress: (uploadPercent) => {
+          const mapped = Math.max(5, Math.min(70, Math.round(uploadPercent * 0.7)));
+          setProgressVisible(true);
+          setProgressLabel("Uploading file...");
+          setProgressPercent(mapped);
+        },
+        onUploadComplete: () => {
+          startProcessingTail("Processing pages...", 72, 95);
+        },
       });
 
-      const data = await parseJsonSafe(res);
+      const data = parseJsonTextSafe(res.text);
 
       if (!res.ok) {
         throw new Error(data?.error || `Plan request failed: ${res.status}`);
@@ -1020,8 +1475,14 @@ export default function App() {
           data?.fileName || selectedFile.name
         }. Click any row to preview that page.`
       );
+
+      finishProgress("Analysis complete.");
     } catch (err) {
       console.error(err);
+      clearProgressTimers();
+      setProgressVisible(false);
+      setProgressPercent(0);
+      setProgressLabel("");
       setStatusMessage("");
       window.alert(err?.message || "Failed to process file.");
     } finally {
@@ -1037,16 +1498,24 @@ export default function App() {
     try {
       setReanalyzing(true);
       setStatusMessage("Re-evaluating PDF using the updated template collection...");
+      beginProgress("Uploading PDF for re-evaluation...");
 
       const formData = new FormData();
       formData.append("file", selectedFile);
 
-      const res = await fetch("/api/plan", {
-        method: "POST",
-        body: formData,
+      const res = await postFormDataWithProgress("/api/plan", formData, {
+        onUploadProgress: (uploadPercent) => {
+          const mapped = Math.max(5, Math.min(70, Math.round(uploadPercent * 0.7)));
+          setProgressVisible(true);
+          setProgressLabel("Uploading PDF for re-evaluation...");
+          setProgressPercent(mapped);
+        },
+        onUploadComplete: () => {
+          startProcessingTail("Re-evaluating pages...", 72, 95);
+        },
       });
 
-      const data = await parseJsonSafe(res);
+      const data = parseJsonTextSafe(res.text);
 
       if (!res.ok) {
         throw new Error(data?.error || `Re-evaluation failed: ${res.status}`);
@@ -1072,8 +1541,14 @@ export default function App() {
       setStatusMessage(
         `Re-evaluation finished. ${nextResults.length} page(s) checked against the updated template collection.`
       );
+
+      finishProgress("Re-evaluation complete.");
     } catch (err) {
       console.error(err);
+      clearProgressTimers();
+      setProgressVisible(false);
+      setProgressPercent(0);
+      setProgressLabel("");
       setStatusMessage("");
       window.alert(err?.message || "Failed to re-evaluate the PDF.");
     } finally {
@@ -1173,6 +1648,11 @@ export default function App() {
     setSelectedResultIndex(0);
     setNewVendorReviews([]);
     setStatusMessage("");
+    closeEditModal();
+    clearProgressTimers();
+    setProgressVisible(false);
+    setProgressPercent(0);
+    setProgressLabel("");
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -1266,7 +1746,7 @@ export default function App() {
           'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
       }}
     >
-      <div style={{ maxWidth: 1400, margin: "0 auto" }}>
+      <div style={{ maxWidth: 1450, margin: "0 auto" }}>
         <header
           style={{
             marginBottom: 24,
@@ -1306,8 +1786,8 @@ export default function App() {
                 }}
               >
                 Upload an invoice PDF, extract vendors and invoice numbers, inspect
-                each page preview, train new templates, and download each page as
-                VENDOR_INVOICENUMBER.pdf.
+                each page preview, train new templates, edit any row, and download
+                each page as VENDOR_INVOICENUMBER.pdf.
               </p>
             </div>
 
@@ -1518,6 +1998,12 @@ export default function App() {
                 {statusMessage}
               </div>
             ) : null}
+
+            <ProgressBar
+              visible={progressVisible}
+              percent={progressPercent}
+              label={progressLabel}
+            />
           </div>
         </section>
 
@@ -1556,7 +2042,7 @@ export default function App() {
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "minmax(680px, 1fr) minmax(340px, 0.95fr)",
+                gridTemplateColumns: "minmax(760px, 1fr) minmax(340px, 0.95fr)",
                 gap: 18,
                 alignItems: "start",
               }}
@@ -1572,7 +2058,7 @@ export default function App() {
                   style={{
                     width: "100%",
                     borderCollapse: "collapse",
-                    minWidth: 1180,
+                    minWidth: 1320,
                     background: "#09131d",
                   }}
                 >
@@ -1586,6 +2072,7 @@ export default function App() {
                       <th style={thStyle}>Official File Name</th>
                       <th style={thStyle}>Template</th>
                       <th style={thStyle}>Match Score</th>
+                      <th style={thStyle}>Edit</th>
                       <th style={thStyle}>Download</th>
                     </tr>
                   </thead>
@@ -1674,13 +2161,33 @@ export default function App() {
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                handleDownloadRow(row);
+                                openEditModalByIndex(index);
                               }}
                               style={{
                                 padding: "10px 14px",
                                 borderRadius: 10,
                                 border: "1px solid rgba(110, 166, 214, 0.35)",
                                 background: "#174060",
+                                color: "#f4fbff",
+                                cursor: "pointer",
+                                fontWeight: 800,
+                              }}
+                            >
+                              Edit
+                            </button>
+                          </td>
+                          <td style={tdStyle}>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDownloadRow(row);
+                              }}
+                              style={{
+                                padding: "10px 14px",
+                                borderRadius: 10,
+                                border: "1px solid rgba(110, 166, 214, 0.35)",
+                                background: "#1d6fa5",
                                 color: "#f4fbff",
                                 cursor: "pointer",
                                 fontWeight: 800,
@@ -1696,7 +2203,11 @@ export default function App() {
                 </table>
               </div>
 
-              <ResultPreviewPanel row={selectedResult} onDownload={handleDownloadRow} />
+              <ResultPreviewPanel
+                row={selectedResult}
+                onDownload={handleDownloadRow}
+                onEdit={openEditModalForRow}
+              />
             </div>
           </section>
         ) : null}
@@ -1706,6 +2217,16 @@ export default function App() {
           saving={savingVendorTemplate}
           onSave={handleSaveVendorTemplate}
           onClose={() => setNewVendorReviews([])}
+        />
+
+        <EditRowModal
+          isOpen={isEditModalOpen}
+          vendorName={editVendorName}
+          invoiceNumber={editInvoiceNumber}
+          onVendorChange={setEditVendorName}
+          onInvoiceChange={setEditInvoiceNumber}
+          onClose={closeEditModal}
+          onSave={saveEditModal}
         />
 
         <footer
