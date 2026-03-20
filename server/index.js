@@ -7,7 +7,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { nanoid } from "nanoid";
 import { PDFDocument } from "pdf-lib";
-import { PORT, CLIENT_ORIGIN, JOB_DIR,FORCE_OCR } from "./config.js";
+import { PORT, CLIENT_ORIGIN, JOB_DIR, FORCE_OCR, VENDOR_CSV_PATH } from "./config.js";
 import { ensureSearchablePdf } from "./utils/ocrWholePdf.js";
 import { makePlan } from "./utils/plan.js";
 import { streamSplitZip, streamBatchZip } from "./utils/split.js";
@@ -17,6 +17,7 @@ import { enrichPlanWithVendorOcr, getVendorCatalogSource } from "./utils/vendorR
 import { getOcrmypdfRunner } from "./utils/ocrmypdfRunner.js";
 import { terminateWorker, getTessdataStatus } from "./utils/tesseractShared.js";
 import { sanitizeFilenameStem } from "./utils/normalize.js";
+import { loadVendorIndex } from "./utils/vendorStore.js";
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -243,6 +244,16 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
+app.get("/api/vendors", (_req, res) => {
+  try {
+    const { entries } = loadVendorIndex();
+    const vendors = entries.map((e) => e.raw);
+    res.json({ vendors, count: vendors.length });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) });
+  }
+});
+
 app.post("/api/ocr/image", upload.single("file"), async (req, res) => {
   try {
     const file = requireFile(req, res);
@@ -277,7 +288,7 @@ app.post("/api/ocr/pdf", upload.single("file"), async (req, res) => {
     const results = await extractInvoiceFieldsFromPdfPages({
       pdfPath,
       pageNumbers: [1, 2, 3, 4, 5, 6, 7, 8],
-      vendorXlsxPath: VENDOR_XLSX_PATH
+      vendorCsvPath: VENDOR_CSV_PATH
     });
 
     res.json({ jobId, results });

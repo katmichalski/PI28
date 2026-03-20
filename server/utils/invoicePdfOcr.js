@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -21,18 +22,15 @@ async function run(bin, args) {
   }
 }
 
-async function loadVendorNamesFromXlsx(xlsxPath) {
-  if (!xlsxPath) return [];
+function loadVendorNamesFromCsv(csvPath) {
+  if (!csvPath) return [];
   try {
-    const xlsx = await import("xlsx");
-    const workbook = xlsx.readFile(xlsxPath);
-    const firstSheet = workbook.SheetNames?.[0];
-    const sheet = firstSheet ? workbook.Sheets[firstSheet] : null;
-    const rows = sheet ? xlsx.utils.sheet_to_json(sheet, { header: 1, defval: "" }) : [];
-    return rows
-      .flatMap((row) => (Array.isArray(row) ? row : []))
-      .map((value) => String(value || "").trim())
+    const content = fsSync.readFileSync(csvPath, "utf8");
+    return content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
       .filter(Boolean)
+      .filter((line) => line.toLowerCase() !== "vendor")
       .filter((value, index, arr) => arr.indexOf(value) === index);
   } catch {
     return [];
@@ -345,11 +343,11 @@ export async function extractInvoiceFieldsFromPdfPage({
   pdfPath,
   pageNumber,
   vendorNames = [],
-  vendorXlsxPath = ""
+  vendorCsvPath = ""
 }) {
   const loadedVendorNames = vendorNames.length
     ? vendorNames
-    : await loadVendorNamesFromXlsx(vendorXlsxPath);
+    : await loadVendorNamesFromCsv(vendorCsvPath);
 
   const vendorCatalog = buildVendorCatalog(loadedVendorNames);
 
@@ -379,7 +377,7 @@ export async function extractInvoiceFieldsFromPdfPages({
   pdfPath,
   pageNumbers,
   vendorNames = [],
-  vendorXlsxPath = ""
+  vendorCsvPath = ""
 }) {
   const results = [];
   for (const pageNumber of pageNumbers || []) {
@@ -388,7 +386,7 @@ export async function extractInvoiceFieldsFromPdfPages({
         pdfPath,
         pageNumber,
         vendorNames,
-        vendorXlsxPath
+        vendorCsvPath
       })
     );
   }

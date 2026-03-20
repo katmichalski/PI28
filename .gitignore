@@ -50,6 +50,7 @@ client/.vite/
 # Backend temp/job output folders
 server/tmp/
 server/tmp/**
+tmp/
 
 # Invoices stored locally
 Invoices/
@@ -61,5 +62,4 @@ server/tessdata/**
 
 # --- server/data: keep ONLY vendor list files ---
 server/data/*
-!server/data/Vendor List.xlsx
-!server/data/Vendor List.xlsx.txt
+!server/data/vendors.csv

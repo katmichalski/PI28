@@ -1,7 +1,6 @@
 import fs from "fs";
 import path from "path";
-import xlsx from "xlsx";
-import { VENDOR_XLSX_PATH } from "../config.js";
+import { VENDOR_CSV_PATH } from "../config.js";
 import { normalizeVendorName } from "./normalize.js";
 
 function ensureDirFor(filePath) {
@@ -9,29 +8,26 @@ function ensureDirFor(filePath) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
-export function loadVendors() {
-  ensureDirFor(VENDOR_XLSX_PATH);
+function parseCsv(content) {
+  return String(content || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
 
-  if (!fs.existsSync(VENDOR_XLSX_PATH)) {
-    // Create empty workbook
-    const wb = xlsx.utils.book_new();
-    const ws = xlsx.utils.aoa_to_sheet([["Vendor"]]);
-    xlsx.utils.book_append_sheet(wb, ws, "Vendors");
-    xlsx.writeFile(wb, VENDOR_XLSX_PATH);
+export function loadVendors() {
+  ensureDirFor(VENDOR_CSV_PATH);
+
+  if (!fs.existsSync(VENDOR_CSV_PATH)) {
+    fs.writeFileSync(VENDOR_CSV_PATH, "Vendor\n", "utf8");
   }
 
-  const wb = xlsx.readFile(VENDOR_XLSX_PATH);
-  const sheetName = wb.SheetNames[0];
-  const ws = wb.Sheets[sheetName];
-  const rows = xlsx.utils.sheet_to_json(ws, { header: 1, blankrows: false });
+  const lines = parseCsv(fs.readFileSync(VENDOR_CSV_PATH, "utf8"));
 
   const vendors = [];
-  for (let i = 0; i < rows.length; i++) {
-    const cell = rows[i]?.[0];
-    if (!cell) continue;
-    const raw = String(cell).trim();
-    if (!raw || raw.toLowerCase() === "vendor") continue;
-    vendors.push(raw);
+  for (const line of lines) {
+    if (line.toLowerCase() === "vendor") continue;
+    vendors.push(line);
   }
 
   // Map normalized -> original
@@ -63,29 +59,3 @@ export function loadVendorIndex() {
 }
 
 
-export function appendVendorIfMissing(vendorRaw) {
-  const vendor = String(vendorRaw || "").trim();
-  if (!vendor) return { added: false };
-
-  const existing = loadVendors();
-  const norm = normalizeVendorName(vendor);
-  if (existing.has(norm)) return { added: false, normalized: norm };
-
-  const wb = xlsx.readFile(VENDOR_XLSX_PATH);
-  const sheetName = wb.SheetNames[0];
-  const ws = wb.Sheets[sheetName];
-  const rows = xlsx.utils.sheet_to_json(ws, { header: 1, blankrows: false });
-
-  // Ensure header
-  if (!rows.length) rows.push(["Vendor"]);
-  if (String(rows[0]?.[0] || "").toLowerCase() !== "vendor") {
-    rows.unshift(["Vendor"]);
-  }
-
-  rows.push([vendor]);
-  const newWs = xlsx.utils.aoa_to_sheet(rows);
-  wb.Sheets[sheetName] = newWs;
-  xlsx.writeFile(wb, VENDOR_XLSX_PATH);
-
-  return { added: true, normalized: norm };
-}

@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { PDFDocument } from "pdf-lib";
-import { loadVendorIndex, appendVendorIfMissing } from "./vendorStore.js";
+import { loadVendorIndex } from "./vendorStore.js";
 import { extractPageObjectsFromPath } from "./pdfText.js";
 import { findInvoiceNumber, findVendor, buildDefaultStem } from "./detect.js";
 import { ocrTopThirdRegions, ocrTopThirdVendorHintsLightGrey, ocrPdfPageAddressHints } from "./imageRegionOcr.js";
@@ -321,28 +321,6 @@ ${topVendorText}` },
     looksLikeNewStart: looksLikeNewStart(text)
   });
 }
-// Auto-add vendors that are not in the vendor list (deduped per run).
-// Only add when we have something reasonable; never add UNKNOWN_VENDOR.
-let vendorsAdded = 0;
-const seenNew = new Set();
-for (const p of pages) {
-  const vn = p.vendorNorm;
-  const vr = p.vendorRaw;
-  if (!vn || vn === "UNKNOWN_VENDOR") continue;
-
-  // If vendor came from the list (exact or fuzzy), it should be present in vendorIndex.map.
-  // If it is NOT in the map, append it to the list.
-  const alreadyInList = vendorIndex?.map?.has?.(vn);
-  if (alreadyInList) continue;
-
-  // De-dupe within this run to avoid repeated writes
-  if (seenNew.has(vn)) continue;
-
-  const r = appendVendorIfMissing(vr);
-  if (r.added) vendorsAdded++;
-  seenNew.add(vn);
-}
-
 // Default: 1 page per group. Optionally merge to 2 pages if strong continuation.
   const groups = [];
   for (let i = 0; i < pages.length; i++) {
@@ -449,5 +427,5 @@ for (const p of pages) {
     });
   }
 
-  return { pages, groups: planned, vendorsAdded, warnings };
+  return { pages, groups: planned, warnings };
 }

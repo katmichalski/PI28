@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { VENDOR_XLSX_PATH } from "../config.js";
+import { VENDOR_CSV_PATH } from "../config.js";
 import { extractInvoiceFieldsFromPdfPage } from "./invoicePdfOcr.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -144,29 +144,26 @@ async function loadVendorCatalog() {
   if (vendorCatalogCache) return vendorCatalogCache;
 
   const candidates = [
-    VENDOR_XLSX_PATH,
+    VENDOR_CSV_PATH,
     process.env.VENDOR_LIST_PATH,
-    path.join(__dirname, "Vendor List.xlsx"),
-    path.resolve(__dirname, "..", "Vendor List.xlsx"),
-    path.resolve(process.cwd(), "Vendor List.xlsx"),
-    path.resolve(process.cwd(), "server", "Vendor List.xlsx"),
-    path.resolve(process.cwd(), "data", "Vendor List.xlsx"),
-    path.resolve(process.cwd(), "server", "data", "Vendor List.xlsx")
+    path.join(__dirname, "vendors.csv"),
+    path.resolve(__dirname, "..", "vendors.csv"),
+    path.resolve(process.cwd(), "vendors.csv"),
+    path.resolve(process.cwd(), "server", "vendors.csv"),
+    path.resolve(process.cwd(), "data", "vendors.csv"),
+    path.resolve(process.cwd(), "server", "data", "vendors.csv")
   ].filter(Boolean);
 
   for (const candidate of candidates) {
     try {
       if (!fs.existsSync(candidate)) continue;
 
-      const xlsx = await import("xlsx");
-      const workbook = xlsx.readFile(candidate);
-      const firstSheet = workbook.SheetNames?.[0];
-      const sheet = firstSheet ? workbook.Sheets[firstSheet] : null;
-      const rows = sheet ? xlsx.utils.sheet_to_json(sheet, { header: 1, defval: "" }) : [];
-      const names = rows
-        .slice(1)
-        .map((row) => String(Array.isArray(row) ? row[0] || "" : "").trim())
-        .filter(Boolean);
+      const content = fs.readFileSync(candidate, "utf8");
+      const names = content
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => line.toLowerCase() !== "vendor");
 
       if (names.length) {
         vendorCatalogLoadedFrom = candidate;

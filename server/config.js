@@ -16,7 +16,7 @@ export const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173
 export const JOB_DIR = process.env.JOB_DIR || "./tmp/jobs";
 
 // Vendor list file path
-export const VENDOR_XLSX_PATH = process.env.VENDOR_XLSX_PATH || "./data/Vendor List.xlsx";
+export const VENDOR_CSV_PATH = process.env.VENDOR_CSV_PATH || "./data/vendors.csv";
 
 // If OCRmyPDF is installed, set this to "1" to force OCR even when some text exists
 export const FORCE_OCR = process.env.FORCE_OCR === "1";

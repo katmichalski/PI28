@@ -23,7 +23,6 @@
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.6.82",
     "tesseract.js": "^5.1.0",
-    "tesseract.js-core": "^5.0.0",
-    "xlsx": "^0.18.5"
+    "tesseract.js-core": "^5.0.0"
   }
 }

@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 // Long-running OCR can take many minutes on scanned PDFs.
 // You can override these in .env as VITE_BATCH_WAIT_MS / VITE_PDF_OCR_WAIT_MS.
 const MAX_BATCH_WAIT_MS = (() => {
@@ -835,6 +835,15 @@ export default function App() {
   const [error, setError] = useState("");
 
   const [preview, setPreview] = useState({ open: false, url: "", title: "" });
+  const [vendorList, setVendorList] = useState(null);
+  const [vendorListOpen, setVendorListOpen] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/vendors")
+      .then((r) => r.json())
+      .then((data) => setVendorList(data))
+      .catch(() => setVendorList({ vendors: [], count: 0 }));
+  }, []);
   // splitSelection: { [jobId]: { [groupIndex]: true } }
   const [splitSelection, setSplitSelection] = useState({});
 
@@ -1285,13 +1294,49 @@ const splitGroupIntoSingles = (fileIdx, groupIdx) => {
           <div className="title">Project Invoice</div>
           <div className="subtitle">Upload one or many PDFs → detect Vendor + Invoice # → split → download ZIP</div>
         </div>
-        <div className="pill">
-          <span>Backend:</span>
-          <a href="/api/health" target="_blank" rel="noreferrer">
-            /api/health
-          </a>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <button
+            className="pill"
+            onClick={() => setVendorListOpen((v) => !v)}
+            style={{ cursor: "pointer", background: "rgba(255,255,255,0.03)" }}
+          >
+            <span>Vendors: {vendorList ? vendorList.count : "..."}</span>
+            <span style={{ fontSize: 10 }}>{vendorListOpen ? "\u25B2" : "\u25BC"}</span>
+          </button>
+          <div className="pill">
+            <span>Backend:</span>
+            <a href="/api/health" target="_blank" rel="noreferrer">
+              /api/health
+            </a>
+          </div>
         </div>
       </div>
+
+      {vendorListOpen && vendorList && (
+        <div className="card" style={{ marginBottom: 14, padding: "12px 16px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <strong style={{ fontSize: 13, letterSpacing: "0.05em", textTransform: "uppercase" }}>
+              Known Vendors ({vendorList.count})
+            </strong>
+            <span className="small">Source: vendors.csv</span>
+          </div>
+          {vendorList.vendors.length === 0 ? (
+            <div className="small">No vendors loaded. Add entries to server/data/vendors.csv</div>
+          ) : (
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
+              gap: "4px 16px",
+              fontSize: 13,
+              color: "var(--muted)"
+            }}>
+              {vendorList.vendors.map((v, i) => (
+                <div key={i} style={{ padding: "3px 0", borderBottom: "1px solid rgba(120,170,255,0.08)" }}>{v}</div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="card">
         <input
