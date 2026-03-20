@@ -1,1630 +1,1756 @@
-import React, { useMemo, useRef, useState } from "react";
-// Long-running OCR can take many minutes on scanned PDFs.
-// You can override these in .env as VITE_BATCH_WAIT_MS / VITE_PDF_OCR_WAIT_MS.
-const MAX_BATCH_WAIT_MS = (() => {
-  const v = Number(import.meta?.env?.VITE_BATCH_WAIT_MS);
-  return Number.isFinite(v) && v > 0 ? v : 2 * 60 * 60 * 1000; // 2 hours
-})();
-const MAX_PDF_OCR_WAIT_MS = (() => {
-  const v = Number(import.meta?.env?.VITE_PDF_OCR_WAIT_MS);
-  return Number.isFinite(v) && v > 0 ? v : 20 * 60 * 1000; // 20 min
-})();
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-
-/**
- * End user flow (supports single OR batch PDFs):
- * 1) Upload PDF(s) -> /api/batch/plan (shows progress)
- * 2) Edit suggested output names (default is "Vendor Name" + "_" + invoiceNumber; vendor keeps spaces)
- * 3) Export -> /api/batch/split (downloads one ZIP with folders per input file)
- */
-
-function formatPct(n) {
-  const v = Math.max(0, Math.min(100, Number(n) || 0));
-  return `${v.toFixed(0)}%`;
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+function normalizeRect(rect) {
+  if (!rect) return null;
+
+  const x = Math.min(rect.x1, rect.x2);
+  const y = Math.min(rect.y1, rect.y2);
+  const width = Math.abs(rect.x2 - rect.x1);
+  const height = Math.abs(rect.y2 - rect.y1);
+
+  return { x, y, width, height };
 }
 
-function buildPreviewUrl(jobId, pages) {
-  const p = Array.isArray(pages) ? pages.join(",") : String(pages || "");
-  return `/api/preview?jobId=${encodeURIComponent(jobId)}&pages=${encodeURIComponent(p)}&t=${Date.now()}`;
+function rectToCss(rect) {
+  if (!rect) return null;
+
+  return {
+    left: `${rect.x * 100}%`,
+    top: `${rect.y * 100}%`,
+    width: `${rect.width * 100}%`,
+    height: `${rect.height * 100}%`,
+  };
 }
 
-function buildOutputDownloadUrl(jobId, pages, name) {
-  const p = Array.isArray(pages) ? pages.join(",") : String(pages || "");
-  const n = String(name || "OUTPUT");
-  return `/api/output?jobId=${encodeURIComponent(jobId)}&pages=${encodeURIComponent(p)}&name=${encodeURIComponent(n)}&t=${Date.now()}`;
-}
-
-function baseName(name) {
-  const b = String(name || "FILE").replace(/\.[^.]+$/, "");
-  const stripped = stripUnitedCorporatePhrase(b)
-    .replace(/[_\-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return stripped || "FILE";
-}
-
-function stripUnitedCorporatePhrase(s) {
-  // "United Corporate Services" is a valid vendor; do not strip it.
-  return String(s || "");
-}
-
-// Invoice number rules (client mirror of server):
-// - digits only, with optional single hyphen '-'
-// - MAY include a single letter (A-Z) in total (common formats: 1V, 123A, A123, 12-345A)
-// - if hyphen exists, it appears AFTER at least 2 digits (e.g., 12-3456)
-// - at most 16 digits total (hyphen not counted)
-function normalizeInvoiceNumber(raw) {
-  const s = String(raw || "").trim();
-  if (!s) return "";
-
-  let cleaned = s.toUpperCase().replace(/[^A-Z0-9\-]+/g, "");
-
-  const firstHyphen = cleaned.indexOf("-");
-  if (firstHyphen !== -1) {
-    cleaned = cleaned.slice(0, firstHyphen + 1) + cleaned.slice(firstHyphen + 1).replace(/-/g, "");
+async function parseJsonSafe(res) {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
   }
-
-  cleaned = cleaned.replace(/^-+/, "").replace(/-+$/, "");
-
-  const letters = cleaned.replace(/[^A-Z]+/g, "");
-  if (letters.length > 1) return "";
-  if (letters.length === 1) {
-    const L = letters;
-    const starts = cleaned.startsWith(L);
-    const ends = cleaned.endsWith(L);
-    if (cleaned === L) return L;
-    if (!(starts || ends)) return "";
-  }
-
-  if (cleaned.includes("-")) {
-    const [a, b] = cleaned.split("-", 2);
-    const aDigits = String(a || "").replace(/\D+/g, "");
-    const bDigits = String(b || "").replace(/\D+/g, "");
-    if (!aDigits || aDigits.length < 2 || !bDigits || bDigits.length < 1) cleaned = (a || "") + (b || "");
-  }
-
-  const digits = cleaned.replace(/\D+/g, "");
-  const letterCount = (cleaned.replace(/[^A-Z]+/g, "") || "").length;
-  if (digits.length === 0) {
-    const lone = cleaned.replace(/-/g, "");
-    return /^[A-Z]$/.test(lone) ? lone : "";
-  }
-  if (letterCount === 0 && digits.length < 2) return "";
-  if (letterCount === 1 && digits.length < 1) return "";
-  if (digits.length > 16) {
-    const L = letters.length === 1 ? letters : "";
-    const keepLeading = L && cleaned.startsWith(L);
-    const keepTrailing = L && cleaned.endsWith(L);
-    const d = digits.slice(0, 16);
-    return `${keepLeading ? L : ""}${d}${keepTrailing ? L : ""}`;
-  }
-  if (cleaned.length > 18) {
-    const L = letters.length === 1 ? letters : "";
-    const keepLeading = L && cleaned.startsWith(L);
-    const keepTrailing = L && cleaned.endsWith(L);
-    return `${keepLeading ? L : ""}${digits}${keepTrailing ? L : ""}`;
-  }
-  return cleaned;
 }
 
-// Convert a vendor-like string into a readable vendor name that keeps SPACES.
-// If the string already has lowercase letters, keep casing (assume user-edited).
-function toVendorDisplayName(vendorLike) {
-  const s0 = stripUnitedCorporatePhrase(String(vendorLike || "")).trim();
-  if (!s0) return "";
+function getFileNameFromDisposition(disposition) {
+  if (!disposition) return "";
 
-  const s = s0
-    .replace(/[\/\\?%*:|"<>]/g, " ")
-    .replace(/[_\-]+/g, " ")
-    .replace(/[^A-Za-z0-9 ]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!s) return "";
-
-  if (/[a-z]/.test(s)) return s;
-
-  const tokens = s.split(" ").filter(Boolean);
-  const out = tokens.map((tok) => {
-    if (/^\d+$/.test(tok)) return tok;
-    if (/^[A-Z]{1,3}$/.test(tok)) return tok;
-    if (/^[0-9A-Z]{1,5}$/.test(tok) && /[0-9]/.test(tok) && /[A-Z]/.test(tok)) return tok;
-
-    const lower = tok.toLowerCase();
-    const m = lower.match(/[a-z]/);
-    if (!m) return tok;
-    const i = m.index ?? 0;
-    return lower.slice(0, i) + lower[i].toUpperCase() + lower.slice(i + 1);
-  });
-
-  return out.join(" ").replace(/\s+/g, " ").trim();
-}
-
-// Convert a stem (which may contain spaces/underscores/hyphens) into lowerCamelCase.
-// Examples: "ACME_SUPPLY_123" -> "acmeSupply123", "7_ELEVEN" -> "7Eleven".
-function toLowerCamelCaseStem(stem) {
-  const s0 = String(stem || "");
-  const s = stripUnitedCorporatePhrase(s0).trim();
-  if (!s) return "";
-
-  const tokens = s
-    .replace(/[\/_\-]+/g, " ")
-    .replace(/[^A-Za-z0-9 ]+/g, " ")
-    .trim()
-    .split(/\s+/g)
-    .filter(Boolean);
-  if (!tokens.length) return "";
-
-  // If the user already typed a single-token camelCase/PascalCase stem, keep internal caps.
-  if (tokens.length === 1) {
-    const tok = tokens[0];
-    if (/[a-z]/.test(tok) && /[A-Z]/.test(tok)) {
-      return tok.charAt(0).toLowerCase() + tok.slice(1);
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
     }
   }
 
+  const normalMatch = disposition.match(/filename="?([^"]+)"?/i);
+  return normalMatch?.[1] || "";
+}
 
-  const capAfterDigits = (tokLower) => {
-    const m = tokLower.match(/[a-z]/);
-    if (!m) return tokLower;
-    const idx = m.index ?? 0;
-    return tokLower.slice(0, idx) + tokLower[idx].toUpperCase() + tokLower.slice(idx + 1);
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let i = 0;
+
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+
+  return `${value.toFixed(value >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function StatusPill({ children, tone = "info" }) {
+  const tones = {
+    info: {
+      background: "rgba(79, 172, 254, 0.14)",
+      border: "1px solid rgba(79, 172, 254, 0.35)",
+      color: "#d7eeff",
+    },
+    success: {
+      background: "rgba(91, 214, 141, 0.14)",
+      border: "1px solid rgba(91, 214, 141, 0.35)",
+      color: "#dfffea",
+    },
+    warning: {
+      background: "rgba(255, 193, 7, 0.14)",
+      border: "1px solid rgba(255, 193, 7, 0.35)",
+      color: "#fff2c2",
+    },
+    danger: {
+      background: "rgba(255, 107, 107, 0.14)",
+      border: "1px solid rgba(255, 107, 107, 0.35)",
+      color: "#ffe3e3",
+    },
   };
 
-  const out = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const lower = String(tokens[i]).toLowerCase();
-    if (i === 0) out.push(lower);
-    else out.push(capAfterDigits(lower));
-  }
-  return out.join("");
-}
-function extractPageVendorNamesFromItem(item) {
-  const byPage = new Map();
+  const style = tones[tone] || tones.info;
 
-  const put = (pageLike, pageIndex, fallback = "", source = "derived") => {
-    const page = Number(pageIndex);
-    if (!Number.isFinite(page) || page < 1) return;
-
-    const name = resolveVendorName(pageLike, fallback) || "Unknown Vendor";
-    const current = byPage.get(page);
-    const next = { page, name, source };
-
-    const currentUnknown = !current || /^unknown vendor$/i.test(String(current.name || ""));
-    const nextUnknown = /^unknown vendor$/i.test(String(next.name || ""));
-
-    if (!current || (currentUnknown && !nextUnknown) || source === "group") {
-      byPage.set(page, next);
-    }
-  };
-
-  for (const page of item?.plan?.pageVendors || []) {
-    put(page, page?.page || page?.pageIndex, page?.vendorName || page?.vendorNorm || "", page?.source || "pageVendors");
-  }
-
-  for (const page of item?.plan?.pages || []) {
-    put(page, page?.pageIndex, page?.vendorName || page?.vendorNorm || "", "page");
-  }
-
-  for (const group of item?.groups || []) {
-    for (const pageNumber of Array.isArray(group?.pages) ? group.pages : []) {
-      put(group, pageNumber, group?.vendorName || group?.vendorNorm || "", "group");
-    }
-  }
-
-  return Array.from(byPage.values()).sort((a, b) => (a.page || 0) - (b.page || 0));
-}
-// Normalize an output stem so it follows <Vendor Name>_<InvoiceNumber>.
-// - Vendor keeps SPACES (no underscores between words)
-// - Separator between vendor and invoice is a SINGLE underscore
-// - Invoice keeps digits with an optional single hyphen
-function toVendorInvoiceStem(stem) {
-  const s0 = stripUnitedCorporatePhrase(String(stem || ""))
-    .replace(/\.pdf$/i, "")
-    .trim();
-
-  const cleaned = s0
-    .replace(/[\/\\?%*:|"<>]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  let vendorPart = cleaned;
-  let invPart = "";
-
-  // Allow invoice numbers that include a single letter (e.g., 1V, 123A, A123, 12-345A)
-  const m2 = cleaned.match(/([A-Za-z0-9][A-Za-z0-9\-]{0,24})\s*$/);
-  if (m2) {
-    const inv = normalizeInvoiceNumber(m2[1]);
-    if (inv) {
-      invPart = inv;
-      vendorPart = cleaned.slice(0, m2.index).trim();
-    }
-  }
-
-  if (!invPart && cleaned.includes("_")) {
-    const parts = cleaned.split(/_+/g).filter(Boolean);
-    if (parts.length >= 2) {
-      const inv = normalizeInvoiceNumber(parts[parts.length - 1]);
-      if (inv) {
-        invPart = inv;
-        vendorPart = parts.slice(0, -1).join(" ").trim();
-      }
-    }
-  }
-
-  const vendorName = toVendorDisplayName(vendorPart) || "Output";
-  const invFinal = invPart || "unknownInvoice";
-  return `${vendorName}_${invFinal}`;
-}
-
-
-// Remove address-like tokens from a normalized vendor string when building output stems.
-// This keeps short leading digits (e.g., 7_ELEVEN) but strips street numbers/zip codes/etc.
-function cleanVendorForStem(vendorNormLike) {
-  const raw = String(vendorNormLike || "").toUpperCase();
-  if (!raw) return "";
-
-  const STREET = new Set([
-    "STREET","ST","ROAD","RD","AVENUE","AVE","BOULEVARD","BLVD","DRIVE","DR","LANE","LN",
-    "COURT","CT","CIRCLE","CIR","HIGHWAY","HWY","PARKWAY","PKWY","PLACE","PL","WAY",
-    "TERRACE","TER","TRAIL","TRL","PIKE","PLAZA","PLZ","SQUARE","SQ","LOOP"
-  ]);
-  const UNIT = new Set(["SUITE","STE","APT","UNIT","FLOOR","FL","BLDG","BUILDING","RM","ROOM"]);
-  const STOP = new Set([
-    // Contact / metadata
-    "FAX","PHONE","TEL","TELEPHONE","PH","PHN","EMAIL","WEB","WWW",
-    "MOBILE","CELL","CEL","CALL","EXT","EXTN","EXTENSION",
-    // Common doc labels
-    "REMIT","REMITTANCE","BILL","BILLTO","SHIP","SHIPTO",
-    "ATTN","ATTENTION","DEPARTMENT","DEPT",
-    // Address-ish
-    "PO","P_O","BOX","ZIP","USA"
-  ]);
-  const STATES = new Set([
-    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS",
-    "KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY",
-    "NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV",
-    "WI","WY","DC"
-  ]);
-  const DIR = new Set(["N","S","E","W","NE","NW","SE","SW","NORTH","SOUTH","EAST","WEST"]);
-
-  const tokens = raw.split("_").filter(Boolean);
-  const out = [];
-  let sawAddress = false;
-
-  const isNum = (s) => /^\d+$/.test(String(s || ""));
-  const numLen = (s) => String(s || "").length;
-
-  const looksLikePhoneRun = (i) => {
-    if (
-      tokens[i] === "1" &&
-      isNum(tokens[i + 1]) &&
-      isNum(tokens[i + 2]) &&
-      isNum(tokens[i + 3]) &&
-      numLen(tokens[i + 1]) === 3 &&
-      numLen(tokens[i + 2]) === 3 &&
-      numLen(tokens[i + 3]) === 4
-    ) {
-      return true;
-    }
-    if (tokens[i] === "1" && isNum(tokens[i + 1]) && numLen(tokens[i + 1]) === 10) return true;
-    if ((tokens[i] === "T" || tokens[i] === "P") && isNum(tokens[i + 1]) && numLen(tokens[i + 1]) >= 3) return true;
-    if (tokens[i] === "1") {
-      for (let k = 1; k <= 3; k++) {
-        const tk = tokens[i + k];
-        if (isNum(tk) && numLen(tk) >= 3) return true;
-      }
-    }
-    return false;
-  };
-
-  const hasStreetSuffixAhead = (fromIdx) => {
-    for (let j = fromIdx; j < Math.min(tokens.length, fromIdx + 7); j++) {
-      if (STREET.has(tokens[j])) return true;
-    }
-    return false;
-  };
-
-  const popTrailingCityish = () => {
-    let popped = 0;
-    while (popped < 2 && out.length > 2) {
-      const last = out[out.length - 1];
-      if (/^[A-Z]{2,}$/.test(last)) {
-        out.pop();
-        popped += 1;
-      } else break;
-    }
-  };
-
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    const next = tokens[i + 1] || "";
-    const prev = tokens[i - 1] || "";
-
-    // Remove "UNITED STATES" country line when present
-    if (t === "UNITED" && next === "STATES") {
-      sawAddress = true;
-      break;
-    }
-
-    if (looksLikePhoneRun(i)) {
-      if (t === "1" && /^\d{3}$/.test(next) && /^\d{3}$/.test(tokens[i + 2] || "") && /^\d{4}$/.test(tokens[i + 3] || "")) {
-        i += 3;
-      } else if (t === "1" && /^\d{10}$/.test(next)) {
-        i += 1;
-      }
-      continue;
-    }
-
-    if (STOP.has(t)) {
-      sawAddress = true;
-      if ((t === "PO" || t === "P_O") && next === "BOX") i++;
-      break;
-    }
-
-    if (STATES.has(t) && /^\d{5}(?:\d{4})?$/.test(next)) {
-      sawAddress = true;
-      popTrailingCityish();
-      break;
-    }
-
-    if (/^\d{5}(?:\d{4})?$/.test(t)) {
-      sawAddress = true;
-      popTrailingCityish();
-      break;
-    }
-
-    if (STREET.has(t)) {
-      sawAddress = true;
-      if (out.length > 1) {
-        const last = out[out.length - 1];
-        if (/^[A-Z]{2,}$/.test(last)) out.pop();
-      }
-      break;
-    }
-
-    if (UNIT.has(t) && /^\d{1,5}$/.test(next)) {
-      sawAddress = true;
-      break;
-    }
-
-    if (DIR.has(t) && (hasStreetSuffixAhead(i + 1) || STREET.has(next))) {
-      sawAddress = true;
-      break;
-    }
-
-    if (isNum(t)) {
-      if (i === 0 && numLen(t) <= 2) {
-        out.push(t);
-        continue;
-      }
-      if (out.length && (numLen(t) >= 3 || hasStreetSuffixAhead(i + 1))) {
-        sawAddress = true;
-        break;
-      }
-      continue;
-    }
-
-    if (/^\d{1,4}$/.test(t) && UNIT.has(prev)) continue;
-    if (/^\d{3,}$/.test(t)) continue;
-
-    out.push(t);
-    if (out.length >= 8) break;
-  }
-
-  while (out.length && /^\d{1,4}$/.test(out[out.length - 1]) && out.length > 1) out.pop();
-
-  const cleaned = out.join("_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
-  if (sawAddress) return cleaned;
-  return cleaned && cleaned.length >= 3 ? cleaned : raw;
-}
-
-
-function normalizeVendorKey(value) {
-  return String(value || "")
-    .toUpperCase()
-    .replace(/&/g, " AND ")
-    .replace(/[^A-Z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function collectTextBits(value, out = []) {
-  if (value == null) return out;
-  if (typeof value === "string" || typeof value === "number") {
-    const s = String(value).trim();
-    if (s) out.push(s);
-    return out;
-  }
-  if (Array.isArray(value)) {
-    for (const v of value) collectTextBits(v, out);
-    return out;
-  }
-  if (typeof value === "object") {
-    for (const v of Object.values(value)) collectTextBits(v, out);
-  }
-  return out;
-}
-
-function pageCandidateText(pageLike) {
-  const preferred = [
-    pageLike?.vendorName,
-    pageLike?.vendorNorm,
-    pageLike?.ocrText,
-    pageLike?.text,
-    pageLike?.rawText,
-    pageLike?.pageText,
-    pageLike?.fullText,
-    pageLike?.headerText,
-    pageLike?.topText,
-    pageLike?.topThirdText,
-    pageLike?.lines,
-    pageLike?.blocks
-  ];
-
-  const extra = [];
-  if (pageLike && typeof pageLike === "object") {
-    for (const [k, v] of Object.entries(pageLike)) {
-      if (/vendor|invoice|pageindex|pages?$/i.test(k)) continue;
-      collectTextBits(v, extra);
-    }
-  }
-
-  return [...collectTextBits(preferred), ...extra].join("\n").trim();
-}
-
-const VENDOR_BAD_LINE_PATTERNS = [
-  /\binvoice\b/i,
-  /\binvoice\s*(number|no|#)\b/i,
-  /\bstatement\b/i,
-  /\bbill\s+to\b/i,
-  /\bship\s+to\b/i,
-  /\bremit\b/i,
-  /\bamount\s+due\b/i,
-  /\btotal\b/i,
-  /\bdate\b/i,
-  /\bterms\b/i,
-  /\bpage\s+\d+\b/i,
-  /\bpo\s*(number|#)?\b/i,
-  /@/,
-  /\bwww\./i,
-  /\bhttps?:\/\//i,
-  /\d{3}[-.\s]\d{3}[-.\s]\d{4}/,
-  /\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b/,
-  /^\$?\d[\d,]*\.\d{2}$/
-];
-
-function looksLikeVendorLine(line) {
-  const s = String(line || "").replace(/\s+/g, " ").trim();
-  if (!s) return false;
-  if (s.length < 4 || s.length > 80) return false;
-  if (VENDOR_BAD_LINE_PATTERNS.some((rx) => rx.test(s))) return false;
-  if (/^\d+$/.test(s)) return false;
-  if (/^\d+\s+[A-Z]/i.test(s)) return false;
-  const words = s.split(/\s+/).filter(Boolean);
-  if (!words.length || words.length > 8) return false;
-  const alphaCount = (s.match(/[A-Za-z]/g) || []).length;
-  if (alphaCount < 4) return false;
-  return true;
-}
-
-function vendorFromText(text) {
-  const raw = String(text || "");
-  if (!raw) return "";
-
-  for (const vendor of KNOWN_VENDOR_PATTERNS) {
-    if (vendor.patterns.some((rx) => rx.test(raw))) return vendor.name;
-  }
-
-  const lines = raw
-    .split(/\r?\n/g)
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter(Boolean)
-    .slice(0, 16);
-
-  for (const line of lines) {
-    if (!looksLikeVendorLine(line)) continue;
-    const cleaned = line
-      .replace(/^from\s+/i, "")
-      .replace(/^vendor\s*[:\-]\s*/i, "")
-      .replace(/[|]+/g, " ")
-      .trim();
-    const canonical = canonicalVendorName(cleaned);
-    if (canonical && normalizeVendorKey(canonical) !== "UNKNOWN VENDOR") return canonical;
-  }
-
-  return "";
-}
-
-function resolveVendorName(pageLike, fallback = "") {
-  const direct = canonicalVendorName(
-    pageLike?.VENDORNAME || pageLike?.vendorName || pageLike?.vendorNorm || pageLike?.vendor || fallback || ""
+  return (
+    <span
+      style={{
+        ...style,
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        padding: "8px 12px",
+        borderRadius: 999,
+        fontSize: 13,
+        fontWeight: 700,
+      }}
+    >
+      {children}
+    </span>
   );
-  if (direct && normalizeVendorKey(direct) !== "UNKNOWN VENDOR") return direct;
-
-  const candidates = [
-    pageLike?.vendorRaw,
-    pageLike?.matchedFrom,
-    pageLike?.vendorMatchedFrom,
-    pageLike?.headerText,
-    pageLike?.topText,
-    pageLike?.ocrText,
-    fallback
-  ]
-    .map((v) => String(v || "").trim())
-    .filter(Boolean);
-
-  for (const candidate of candidates) {
-    const canonical = canonicalVendorName(candidate);
-    if (canonical && normalizeVendorKey(canonical) !== "UNKNOWN VENDOR") {
-      return canonical;
-    }
-
-    const normalized = normalizeVendorKey(candidate);
-
-    if (/\bWWW\s+CLASINFO\b/.test(normalized) || /\bCLASINFO\b/.test(normalized) || /\bCLAS\b/.test(normalized)) {
-      return "Clas Information Services";
-    }
-
-    if (/\bRASI[\s_]+NCSI\b/.test(normalized)) {
-      return "Rasi_NCSI";
-    }
-
-    if (/\bDOC[\s-]*U[\s-]*SEARCH\b/.test(normalized)) {
-      return "Doc-U-Search";
-    }
-  }
-
-  return canonicalVendorName(fallback || "") || "Unknown Vendor";
-}
-  // existing fallback logic continues...
-
-const KNOWN_VENDOR_PATTERNS = [
-  {
-    name: "PST Abstracting, Inc.",
-    patterns: [/\bPST\s+ABSTRACT/i, /\bPST\b.*\bINC\b/i]
-  },
-  {
-    name: "CT Filing & Search Services, LLC",
-    patterns: [/\bCT\s+FILING\b/i, /\bSEARCH\s+SERVICES\b.*\bLLC\b/i]
-  },
-  {
-    name: "CLAS Information Services",
-    patterns: [/\bCLAS\s+INFORMATION\s+SERVICES\b/i, /\bCLAS\b.*\bINFORMATION\b/i]
-  },
-  {
-    name: "United Corporate Services, Inc.",
-    patterns: [/\bUNITED\s+CORPORATE\s+SERVICES\b/i, /\bUCS\b.*\bCORPORATE\b/i]
-  },
-  {
-    name: "Pioneer Corporate Services",
-    patterns: [/\bPIONEER\s+CORPORATE\s+SERVICES\b/i, /\bPIONEER\b.*\bCORPORATE\b/i]
-  }
-];
-
-function canonicalVendorName(raw) {
-  const key = normalizeVendorKey(raw);
-  if (!key) return "";
-
-  for (const vendor of KNOWN_VENDOR_PATTERNS) {
-    if (vendor.patterns.some((rx) => rx.test(key))) return vendor.name;
-  }
-
-  return toVendorDisplayName(raw);
 }
 
-function extractVendorNamesFromItem(item) {
-  const seen = new Set();
-  const out = [];
+function ResultPreviewPanel({ row, onDownload }) {
+  if (!row) {
+    return (
+      <div
+        style={{
+          borderRadius: 18,
+          padding: 18,
+          border: "1px solid rgba(85, 140, 190, 0.24)",
+          background: "#0b1824",
+          color: "#9fc3df",
+        }}
+      >
+        Click a row to preview that page.
+      </div>
+    );
+  }
 
-  const addVendor = (pageLike, pageIndex, fallback = "") => {
-    const name = resolveVendorName(pageLike, fallback);
-    if (!name || /^unknown vendor$/i.test(name)) return;
-    const k = `${pageIndex || "?"}__${name}`;
-    if (seen.has(k)) return;
-    seen.add(k);
-    out.push({
-      page: Number(pageIndex) || null,
-      name
+  return (
+    <div
+      style={{
+        borderRadius: 18,
+        padding: 16,
+        border: "1px solid rgba(85, 140, 190, 0.24)",
+        background: "#0b1824",
+      }}
+    >
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ color: "#e7f6ff", fontWeight: 900, fontSize: 20 }}>
+          Selected Page Preview
+        </div>
+        <div style={{ color: "#9fc3df", marginTop: 6, lineHeight: 1.6 }}>
+          Page <strong>{row.pageNumber ?? "-"}</strong> · Vendor{" "}
+          <strong>{row.vendorName || "-"}</strong> · Invoice{" "}
+          <strong>{row.invoiceNumber || "-"}</strong>
+        </div>
+      </div>
+
+      <div
+        style={{
+          borderRadius: 16,
+          overflow: "hidden",
+          border: "1px solid rgba(85, 140, 190, 0.2)",
+          background: "#07131d",
+          minHeight: 320,
+        }}
+      >
+        {row.previewUrl ? (
+          <img
+            src={row.previewUrl}
+            alt={`Preview page ${row.pageNumber}`}
+            style={{
+              display: "block",
+              width: "100%",
+              height: "auto",
+            }}
+          />
+        ) : (
+          <div
+            style={{
+              minHeight: 320,
+              display: "grid",
+              placeItems: "center",
+              color: "#9fc3df",
+              padding: 24,
+              textAlign: "center",
+            }}
+          >
+            No preview image was returned for this page by the backend.
+          </div>
+        )}
+      </div>
+
+      <div
+        style={{
+          marginTop: 14,
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+          gap: 10,
+        }}
+      >
+        <div
+          style={{
+            borderRadius: 12,
+            padding: 12,
+            background: "#0d2233",
+            border: "1px solid rgba(85, 140, 190, 0.2)",
+          }}
+        >
+          <div style={{ color: "#d7eeff", fontWeight: 800, marginBottom: 6 }}>
+            Vendor
+          </div>
+          <div style={{ color: "#cbe6fb" }}>{row.vendorName || "-"}</div>
+        </div>
+
+        <div
+          style={{
+            borderRadius: 12,
+            padding: 12,
+            background: "#0d2233",
+            border: "1px solid rgba(85, 140, 190, 0.2)",
+          }}
+        >
+          <div style={{ color: "#d7eeff", fontWeight: 800, marginBottom: 6 }}>
+            Invoice Number
+          </div>
+          <div style={{ color: "#cbe6fb" }}>{row.invoiceNumber || "-"}</div>
+        </div>
+
+        <div
+          style={{
+            borderRadius: 12,
+            padding: 12,
+            background: "#0d2233",
+            border: "1px solid rgba(85, 140, 190, 0.2)",
+          }}
+        >
+          <div style={{ color: "#d7eeff", fontWeight: 800, marginBottom: 6 }}>
+            Official File Name
+          </div>
+          <div style={{ color: "#cbe6fb", wordBreak: "break-word" }}>
+            {row.officialFileName || "-"}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 14 }}>
+        <button
+          type="button"
+          onClick={() => onDownload?.(row)}
+          style={{
+            padding: "12px 16px",
+            borderRadius: 12,
+            border: "1px solid rgba(110, 166, 214, 0.35)",
+            background: "#1d6fa5",
+            color: "#f4fbff",
+            cursor: "pointer",
+            fontWeight: 800,
+          }}
+        >
+          Download This Page
+        </button>
+      </div>
+
+      {row.detectedText ? (
+        <div
+          style={{
+            marginTop: 14,
+            borderRadius: 14,
+            padding: 12,
+            background: "#0d2233",
+            border: "1px solid rgba(85, 140, 190, 0.2)",
+          }}
+        >
+          <div style={{ color: "#d7eeff", fontWeight: 800, marginBottom: 8 }}>
+            OCR Preview
+          </div>
+          <div
+            style={{
+              whiteSpace: "pre-wrap",
+              maxHeight: 180,
+              overflow: "auto",
+              color: "#9fc3df",
+              fontSize: 13,
+              lineHeight: 1.5,
+            }}
+          >
+            {row.detectedText}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function VendorFieldTrainer({ items, onSave, onClose, saving }) {
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [mode, setMode] = useState("vendor");
+  const [vendorName, setVendorName] = useState("");
+  const [vendorBox, setVendorBox] = useState(null);
+  const [invoiceBox, setInvoiceBox] = useState(null);
+  const [dragging, setDragging] = useState(false);
+  const [draftRect, setDraftRect] = useState(null);
+  const imageWrapRef = useRef(null);
+
+  const current = items[currentIndex] || null;
+
+  useEffect(() => {
+    if (!current) return;
+    setVendorName(current.suggestedVendorName || "");
+    setVendorBox(current.vendorBox || null);
+    setInvoiceBox(current.invoiceBox || null);
+    setMode("vendor");
+    setDragging(false);
+    setDraftRect(null);
+  }, [currentIndex, current]);
+
+  useEffect(() => {
+    if (currentIndex > Math.max(0, items.length - 1)) {
+      setCurrentIndex(Math.max(0, items.length - 1));
+    }
+  }, [items.length, currentIndex]);
+
+  function getRelativePoint(clientX, clientY) {
+    const el = imageWrapRef.current;
+    if (!el) return null;
+
+    const bounds = el.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) return null;
+
+    return {
+      x: clamp((clientX - bounds.left) / bounds.width, 0, 1),
+      y: clamp((clientY - bounds.top) / bounds.height, 0, 1),
+    };
+  }
+
+  function handlePointerDown(e) {
+    if (!mode) return;
+    const pt = getRelativePoint(e.clientX, e.clientY);
+    if (!pt) return;
+
+    setDragging(true);
+    setDraftRect({
+      x1: pt.x,
+      y1: pt.y,
+      x2: pt.x,
+      y2: pt.y,
     });
-  };
-
-  for (const page of item?.plan?.pages || []) {
-    addVendor(page, page?.pageIndex, page?.vendorName || page?.vendorNorm || "");
   }
 
-  if (!out.length) {
-    for (const group of item?.groups || []) {
-      const firstPage = Array.isArray(group?.pages) ? group.pages[0] : null;
-      addVendor(group, firstPage, group?.vendorName || group?.vendorNorm || "");
+  function handlePointerMove(e) {
+    if (!dragging) return;
+    const pt = getRelativePoint(e.clientX, e.clientY);
+    if (!pt) return;
+
+    setDraftRect((prev) =>
+      prev
+        ? {
+            ...prev,
+            x2: pt.x,
+            y2: pt.y,
+          }
+        : prev
+    );
+  }
+
+  function handlePointerUp(e) {
+    if (!dragging) return;
+
+    const pt = getRelativePoint(e.clientX, e.clientY);
+    const finalDraft =
+      draftRect && pt
+        ? {
+            ...draftRect,
+            x2: pt.x,
+            y2: pt.y,
+          }
+        : draftRect;
+
+    const rect = normalizeRect(finalDraft);
+
+    setDragging(false);
+    setDraftRect(null);
+
+    if (!rect || rect.width < 0.01 || rect.height < 0.01) return;
+
+    if (mode === "vendor") {
+      setVendorBox(rect);
+      setMode("invoice");
+    } else if (mode === "invoice") {
+      setInvoiceBox(rect);
+      setMode(null);
     }
   }
 
-  return out.sort((a, b) => (a.page || 0) - (b.page || 0));
-}
+  async function handleSaveCurrent() {
+    if (!current) return;
 
-function defaultStem(vendorNorm, invoiceNumber) {
-  // Guard against common header labels accidentally being detected as vendor.
-  const isBadVendorLabel = (s) => {
-    const n0 = String(s || "")
-      .replace(/_/g, " ")
-      .replace(/[#:]+/g, " ")
-      .replace(/[^A-Za-z0-9 ]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .toLowerCase();
-    if (!n0) return true;
-
-    // Common OCR swaps: l/1/|/! -> i, 0 -> o. Only used for label checks.
-    const n = n0
-      .replace(/^l(?=nvoice\b)/, "i")
-      .replace(/[|!]/g, "i")
-      .replace(/1/g, "i")
-      .replace(/0/g, "o")
-      .replace(/\s+/g, " ")
-      .trim();
-    const exact = new Set([
-      "invoice date",
-      "invoice",
-      "invoice number",
-      "invoice no",
-      "invoice #",
-      "inv #",
-      "due date",
-      "bill to",
-      "ship to",
-      "sold to",
-      "remit to",
-      "remittance",
-      "purchase order",
-      "po number",
-      "terms",
-      "subtotal",
-      "tax",
-      "total",
-      "amount due",
-      "balance due"
-    ]);
-    if (exact.has(n)) return true;
-    if (/^(invoice\s*(date|number|no|#)|inv\s*#|due\s*date|bill\s*to|ship\s*to|remit\s*to)\b/.test(n)) return true;
-    if (/^invoicedate\b/.test(n.replace(/\s+/g, ""))) return true;
-    return false;
-  };
-
-  const safeVendorNorm = isBadVendorLabel(vendorNorm) ? "UNKNOWN_VENDOR" : vendorNorm;
-
-  const v0 = String(safeVendorNorm || "UNKNOWN_VENDOR")
-    .toUpperCase()
-    .replace(/[^A-Z0-9_]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
-
-  const vClean = cleanVendorForStem(v0) || "UNKNOWN_VENDOR";
-  const vendorName = toVendorDisplayName(vClean) || "Unknown Vendor";
-
-  const inv = normalizeInvoiceNumber(invoiceNumber || "");
-  const invPart = inv || "unknownInvoice";
-
-  return `${vendorName}_${invPart}`;
-}
-
-
-function dedupeStems(groups) {
-  const used = new Map();
-  return (groups || []).map((g) => {
-    const stem = String(g.suggestedStem || g.stem || "OUTPUT");
-    // Keep vendor names reusable. If two outputs have the same stem,
-    // add a numeric suffix AFTER the invoice portion (e.g. "Vendor_123_2")
-    // instead of altering the vendor name (e.g. "Copy2").
-    const base = stem;
-    const count = (used.get(base) || 0) + 1;
-    used.set(base, count);
-    if (count === 1) return g;
-
-    const hasPdfExt = /\.pdf$/i.test(base);
-    const b = hasPdfExt ? base.replace(/\.pdf$/i, "") : base;
-    return { ...g, suggestedStem: `${b}_${count}${hasPdfExt ? ".pdf" : ""}` };
-  });
-}
-
-function parsePages(value) {
-  const nums = String(value || "")
-    .split(/[^0-9]+/g)
-    .map((x) => Number(x))
-    .filter((n) => Number.isFinite(n) && n >= 1);
-  // de-dupe while keeping order
-  const seen = new Set();
-  const out = [];
-  for (const n of nums) {
-    if (!seen.has(n)) {
-      seen.add(n);
-      out.push(n);
+    if (!vendorName.trim()) {
+      window.alert("Enter the vendor name first.");
+      return;
     }
+
+    if (!vendorBox) {
+      window.alert("Draw the Vendor Name box first.");
+      return;
+    }
+
+    if (!invoiceBox) {
+      window.alert("Draw the Invoice Number box first.");
+      return;
+    }
+
+    await onSave({
+      reviewId: current.reviewId,
+      fileName: current.fileName,
+      pageNumber: current.pageNumber,
+      vendorName: vendorName.trim(),
+      vendorBox,
+      invoiceBox,
+    });
   }
-  // cap to 2 pages per invoice as per rules
-  return out.slice(0, 2);
+
+  if (!items?.length) return null;
+
+  const vendorStyle = rectToCss(vendorBox);
+  const invoiceStyle = rectToCss(invoiceBox);
+  const draftStyle = rectToCss(normalizeRect(draftRect));
+
+  return (
+    <section
+      style={{
+        marginTop: 24,
+        borderRadius: 20,
+        padding: 20,
+        border: "1px solid rgba(85, 140, 190, 0.24)",
+        background: "rgba(10, 22, 34, 0.92)",
+        boxShadow: "0 18px 50px rgba(0, 0, 0, 0.28)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 12,
+          flexWrap: "wrap",
+          marginBottom: 16,
+        }}
+      >
+        <div>
+          <h2
+            style={{
+              margin: 0,
+              fontSize: 22,
+              color: "#e7f6ff",
+            }}
+          >
+            New Vendor Review
+          </h2>
+          <div style={{ marginTop: 6, color: "#9fc3df" }}>
+            Use the page preview below to mark exactly where the Vendor Name and
+            Invoice Number appear.
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={onClose}
+          style={{
+            border: "1px solid rgba(110, 166, 214, 0.35)",
+            background: "#0d2335",
+            color: "#e7f6ff",
+            borderRadius: 12,
+            padding: "10px 14px",
+            cursor: "pointer",
+            fontWeight: 700,
+          }}
+        >
+          Close Review
+        </button>
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "minmax(320px, 1.25fr) minmax(280px, 0.75fr)",
+          gap: 18,
+        }}
+      >
+        <div>
+          <div
+            style={{
+              display: "flex",
+              gap: 10,
+              flexWrap: "wrap",
+              marginBottom: 12,
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setMode("vendor")}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid rgba(90, 214, 143, 0.4)",
+                background: mode === "vendor" ? "#174e34" : "#0f2538",
+                color: "#e5fff0",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              Mark Vendor Name
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setMode("invoice")}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid rgba(93, 173, 226, 0.4)",
+                background: mode === "invoice" ? "#174060" : "#0f2538",
+                color: "#e5f4ff",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              Mark Invoice Number
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setVendorBox(null)}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid rgba(110, 166, 214, 0.35)",
+                background: "#0f2538",
+                color: "#e5f4ff",
+                cursor: "pointer",
+              }}
+            >
+              Clear Vendor Box
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setInvoiceBox(null)}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid rgba(110, 166, 214, 0.35)",
+                background: "#0f2538",
+                color: "#e5f4ff",
+                cursor: "pointer",
+              }}
+            >
+              Clear Invoice Box
+            </button>
+          </div>
+
+          <div
+            ref={imageWrapRef}
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerLeave={handlePointerUp}
+            style={{
+              position: "relative",
+              width: "100%",
+              minHeight: 420,
+              borderRadius: 18,
+              overflow: "hidden",
+              border: "1px solid rgba(85, 140, 190, 0.28)",
+              background: "#07131d",
+              userSelect: "none",
+              touchAction: "none",
+              cursor:
+                mode === "vendor" || mode === "invoice" ? "crosshair" : "default",
+            }}
+          >
+            {current.previewUrl ? (
+              <img
+                src={current.previewUrl}
+                alt={`Review page ${current.pageNumber}`}
+                draggable={false}
+                style={{
+                  display: "block",
+                  width: "100%",
+                  height: "auto",
+                }}
+              />
+            ) : (
+              <div
+                style={{
+                  minHeight: 420,
+                  display: "grid",
+                  placeItems: "center",
+                  padding: 24,
+                  textAlign: "center",
+                  color: "#9fc3df",
+                }}
+              >
+                No page preview was returned by the backend for this page.
+              </div>
+            )}
+
+            {vendorStyle && (
+              <div
+                style={{
+                  position: "absolute",
+                  ...vendorStyle,
+                  border: "2px solid #5bd68d",
+                  background: "rgba(91, 214, 141, 0.14)",
+                  boxSizing: "border-box",
+                }}
+              >
+                <div
+                  style={{
+                    position: "absolute",
+                    top: -28,
+                    left: 0,
+                    background: "#5bd68d",
+                    color: "#052113",
+                    padding: "4px 8px",
+                    borderRadius: 8,
+                    fontWeight: 800,
+                    fontSize: 12,
+                  }}
+                >
+                  Vendor
+                </div>
+              </div>
+            )}
+
+            {invoiceStyle && (
+              <div
+                style={{
+                  position: "absolute",
+                  ...invoiceStyle,
+                  border: "2px solid #5dade2",
+                  background: "rgba(93, 173, 226, 0.14)",
+                  boxSizing: "border-box",
+                }}
+              >
+                <div
+                  style={{
+                    position: "absolute",
+                    top: -28,
+                    left: 0,
+                    background: "#5dade2",
+                    color: "#041d30",
+                    padding: "4px 8px",
+                    borderRadius: 8,
+                    fontWeight: 800,
+                    fontSize: 12,
+                  }}
+                >
+                  Invoice #
+                </div>
+              </div>
+            )}
+
+            {draftStyle && (
+              <div
+                style={{
+                  position: "absolute",
+                  ...draftStyle,
+                  border: "2px dashed #ffd166",
+                  background: "rgba(255, 209, 102, 0.12)",
+                  boxSizing: "border-box",
+                }}
+              />
+            )}
+          </div>
+        </div>
+
+        <div
+          style={{
+            borderRadius: 18,
+            padding: 16,
+            border: "1px solid rgba(85, 140, 190, 0.24)",
+            background: "#0b1824",
+          }}
+        >
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ color: "#d7eeff", fontWeight: 800, marginBottom: 6 }}>
+              Review Item
+            </div>
+            <div style={{ color: "#9fc3df", lineHeight: 1.6, fontSize: 14 }}>
+              File: <strong>{current.fileName || "Unknown file"}</strong>
+              <br />
+              Page: <strong>{current.pageNumber ?? "-"}</strong>
+              <br />
+              Queue: <strong>{currentIndex + 1}</strong> of{" "}
+              <strong>{items.length}</strong>
+            </div>
+          </div>
+
+          <label
+            htmlFor="vendorName"
+            style={{
+              display: "block",
+              marginBottom: 8,
+              color: "#e7f6ff",
+              fontWeight: 800,
+            }}
+          >
+            Confirm Vendor Name
+          </label>
+
+          <input
+            id="vendorName"
+            value={vendorName}
+            onChange={(e) => setVendorName(e.target.value)}
+            placeholder="Enter vendor name"
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              padding: "12px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(110, 166, 214, 0.35)",
+              background: "#0f2232",
+              color: "#eef8ff",
+              outline: "none",
+              marginBottom: 16,
+            }}
+          />
+
+          <div
+            style={{
+              borderRadius: 14,
+              padding: 12,
+              background: "#0d2233",
+              border: "1px solid rgba(85, 140, 190, 0.2)",
+            }}
+          >
+            <div style={{ color: "#d7eeff", fontWeight: 800, marginBottom: 8 }}>
+              Required Steps
+            </div>
+            <div style={{ color: "#9fc3df", fontSize: 14, lineHeight: 1.7 }}>
+              1. Enter the vendor name.
+              <br />
+              2. Click <strong>Mark Vendor Name</strong> and drag a box.
+              <br />
+              3. Click <strong>Mark Invoice Number</strong> and drag a box.
+              <br />
+              4. Save the template.
+            </div>
+          </div>
+
+          <div
+            style={{
+              marginTop: 14,
+              borderRadius: 14,
+              padding: 12,
+              background: "#0d2233",
+              border: "1px solid rgba(85, 140, 190, 0.2)",
+            }}
+          >
+            <div style={{ color: "#d7eeff", fontWeight: 800, marginBottom: 8 }}>
+              Status
+            </div>
+            <div
+              style={{
+                color: vendorBox ? "#98f0be" : "#ffd792",
+                fontSize: 14,
+                marginBottom: 4,
+              }}
+            >
+              Vendor box: {vendorBox ? "set" : "missing"}
+            </div>
+            <div
+              style={{
+                color: invoiceBox ? "#8fd2ff" : "#ffd792",
+                fontSize: 14,
+              }}
+            >
+              Invoice box: {invoiceBox ? "set" : "missing"}
+            </div>
+          </div>
+
+          {current.detectedText ? (
+            <div
+              style={{
+                marginTop: 14,
+                borderRadius: 14,
+                padding: 12,
+                background: "#0d2233",
+                border: "1px solid rgba(85, 140, 190, 0.2)",
+              }}
+            >
+              <div style={{ color: "#d7eeff", fontWeight: 800, marginBottom: 8 }}>
+                OCR Preview
+              </div>
+              <div
+                style={{
+                  whiteSpace: "pre-wrap",
+                  maxHeight: 160,
+                  overflow: "auto",
+                  color: "#9fc3df",
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                }}
+              >
+                {current.detectedText}
+              </div>
+            </div>
+          ) : null}
+
+          <div
+            style={{
+              display: "flex",
+              gap: 10,
+              flexWrap: "wrap",
+              marginTop: 16,
+            }}
+          >
+            <button
+              type="button"
+              onClick={handleSaveCurrent}
+              disabled={saving}
+              style={{
+                padding: "12px 16px",
+                borderRadius: 12,
+                border: "1px solid rgba(110, 166, 214, 0.35)",
+                background: saving ? "#31506a" : "#1d6fa5",
+                color: "#f4fbff",
+                cursor: saving ? "not-allowed" : "pointer",
+                fontWeight: 800,
+              }}
+            >
+              {saving ? "Saving..." : "Save Template"}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setCurrentIndex((prev) => Math.max(0, prev - 1))}
+              disabled={currentIndex === 0}
+              style={{
+                padding: "12px 16px",
+                borderRadius: 12,
+                border: "1px solid rgba(110, 166, 214, 0.35)",
+                background: "#0f2538",
+                color: "#e5f4ff",
+                cursor: currentIndex === 0 ? "not-allowed" : "pointer",
+                opacity: currentIndex === 0 ? 0.55 : 1,
+              }}
+            >
+              Previous
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                setCurrentIndex((prev) => Math.min(items.length - 1, prev + 1))
+              }
+              disabled={currentIndex >= items.length - 1}
+              style={{
+                padding: "12px 16px",
+                borderRadius: 12,
+                border: "1px solid rgba(110, 166, 214, 0.35)",
+                background: "#0f2538",
+                color: "#e5f4ff",
+                cursor:
+                  currentIndex >= items.length - 1 ? "not-allowed" : "pointer",
+                opacity: currentIndex >= items.length - 1 ? 0.55 : 1,
+              }}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
 }
-
-async function xhrUpload({ url, formData, onProgress }) {
-  return await new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", url, true);
-    xhr.responseType = "json";
-
-    xhr.upload.onprogress = (evt) => {
-      if (evt.lengthComputable && onProgress) {
-        const pct = (evt.loaded / evt.total) * 100;
-        onProgress(pct);
-      }
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response);
-      else reject(new Error(xhr.response?.error || `Upload failed (${xhr.status})`));
-    };
-    xhr.onerror = () => reject(new Error("Network error during upload"));
-    xhr.send(formData);
-  });
-}
-
-function useDragActive() {
-  const counter = useRef(0);
-  const [active, setActive] = useState(false);
-
-  const onDragEnter = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    counter.current += 1;
-    setActive(true);
-  };
-
-  const onDragLeave = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    counter.current -= 1;
-    if (counter.current <= 0) {
-      counter.current = 0;
-      setActive(false);
-    }
-  };
-
-  const onDragOver = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-  };
-
-  const reset = () => {
-    counter.current = 0;
-    setActive(false);
-  };
-
-  return { active, onDragEnter, onDragLeave, onDragOver, reset };
-}
-
 
 export default function App() {
   const fileInputRef = useRef(null);
-  const outputRef = useRef(null);
 
-  // Prevent multiple overlapping polling loops / EventSource streams
-  const pollTokensRef = useRef({ batch: 0, pdf: 0 });
-  const streamClosersRef = useRef({ batch: null, pdf: null, export: null });
+  const [booting, setBooting] = useState(true);
+  const [bootError, setBootError] = useState("");
+  const [serverReady, setServerReady] = useState(false);
+  const [serverInfo, setServerInfo] = useState(null);
 
-  const batchDnD = useDragActive();
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [dragActive, setDragActive] = useState(false);
 
-  const [files, setFiles] = useState([]); // File[]
-  const [uploadPct, setUploadPct] = useState(0);
+  const [planning, setPlanning] = useState(false);
+  const [reanalyzing, setReanalyzing] = useState(false);
+  const [savingVendorTemplate, setSavingVendorTemplate] = useState(false);
 
-  const [batchJobId, setBatchJobId] = useState("");
-  const [progress, setProgress] = useState(null);
+  const [results, setResults] = useState([]);
+  const [selectedResultIndex, setSelectedResultIndex] = useState(0);
+  const [newVendorReviews, setNewVendorReviews] = useState([]);
+  const [statusMessage, setStatusMessage] = useState("");
 
-  // items: [{ sourceName, jobId, plan, groups }]
-  const [items, setItems] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
 
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+    async function boot() {
+      setBooting(true);
+      setBootError("");
 
-  const [preview, setPreview] = useState({ open: false, url: "", title: "" });
-  // splitSelection: { [jobId]: { [groupIndex]: true } }
-  const [splitSelection, setSplitSelection] = useState({});
+      const timeoutId = window.setTimeout(() => {
+        controller.abort();
+      }, 8000);
 
-  const canAnalyze = useMemo(() => files.length > 0 && !busy, [files, busy]);
-  const canExport = useMemo(
-    () =>
-      !!batchJobId &&
-      items.some((it) => (it.groups || []).some((g) => Array.isArray(g.pages) && g.pages.length > 0)) &&
-      !busy,
-    [batchJobId, items, busy]
-  );
+      try {
+        const res = await fetch("/api/health", {
+          method: "GET",
+          signal: controller.signal,
+        });
 
-const vendorResults = useMemo(
-  () => items.map((it) => ({ jobId: it.jobId, sourceName: it.sourceName, vendors: extractPageVendorNamesFromItem(it) })),
-  [items]
-);
+        window.clearTimeout(timeoutId);
 
-  const openPicker = () => fileInputRef.current?.click();
+        const data = await parseJsonSafe(res);
 
-  const reset = () => {
-    setError("");
-    setItems([]);
-    setBatchJobId("");
-    setProgress(null);
-    setUploadPct(0);
-  };
-
-  const onPickFiles = (fileList) => {
-    reset();
-    const arr = Array.from(fileList || []).filter((f) => f && /pdf$/i.test(f.name));
-    setFiles(arr);
-  };
-
-  const onDrop = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    batchDnD.reset();
-    onPickFiles(e.dataTransfer.files);
-  };
-
-
-  const listenProgress = (jid, opts = {}) => {
-    const setter = typeof opts?.setState === "function" ? opts.setState : setProgress;
-    const onDone = typeof opts?.onDone === "function" ? opts.onDone : null;
-    const onError = typeof opts?.onError === "function" ? opts.onError : null;
-
-    const ctl = { stopped: false };
-
-    (async function pollProgress() {
-      while (!ctl.stopped) {
-        try {
-          const r = await fetch(`/api/progress/${encodeURIComponent(jid)}?once=1&t=${Date.now()}`, {
-            cache: "no-store"
-          });
-
-          if (!r.ok) {
-            throw new Error(`Progress request failed (${r.status})`);
-          }
-
-          const data = await r.json().catch(() => null);
-          if (data) setter(data);
-
-          if (data?.done) {
-            ctl.stopped = true;
-            try {
-              onDone?.(data);
-            } catch {}
-            break;
-          }
-        } catch (err) {
-          ctl.stopped = true;
-          try {
-            onError?.(err);
-          } catch {}
-          break;
+        if (!res.ok) {
+          throw new Error(data?.error || `Health check failed: ${res.status}`);
         }
 
-        await new Promise((resolve) => setTimeout(resolve, 700));
+        if (!cancelled) {
+          setServerReady(Boolean(data?.ok));
+          setServerInfo(data || null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setServerReady(false);
+          setBootError(
+            err?.name === "AbortError"
+              ? "Backend did not respond in time."
+              : err?.message || "Failed to reach backend."
+          );
+        }
+      } finally {
+        window.clearTimeout(timeoutId);
+        if (!cancelled) {
+          setBooting(false);
+        }
       }
-    })();
+    }
+
+    boot();
 
     return () => {
-      ctl.stopped = true;
+      cancelled = true;
+      controller.abort();
     };
-  };
+  }, []);
 
-
-  const hydrateBatchItems = (rawItems) => {
-    return (rawItems || []).map((it) => {
-      const plan = it.plan || null;
-      const groups = (plan?.groups || []).map((g) => ({
-        ...g,
-        suggestedStem: g.suggestedStem || g.stem || "OUTPUT"
-      }));
-      return {
-        sourceName: it.sourceName,
-        jobId: it.jobId,
-        ocrApplied: it.ocrApplied,
-        ocrError: it.ocrError,
-        itemError: it.error || "",
-        plan,
-        groups
-      };
-    });
-  };
-
-  const fetchBatchPlanResults = async (jid) => {
-    // Avoid HTTP cache revalidation returning 304 (which has no body and breaks r.json())
-    const r = await fetch('/api/batch/plan/' + encodeURIComponent(jid), { cache: 'no-store' });
-    const data = await r.json().catch(() => ({}));
-    return { ok: r.ok, status: r.status, data };
-  };
-
-  const runBatchPlan = async () => {
-    if (!files.length) return;
-    setBusy(true);
-    setError("");
-    setUploadPct(0);
-    setProgress(null);
-
-    let waitingAsync = false;
-
-    try {
-      const fd = new FormData();
-      for (const f of files) fd.append("files", f);
-
-      // Use async batch planning so the upload request returns quickly.
-      // Sync mode can sit in DevTools as “pending” for minutes while OCR/analysis runs.
-      // Async mode returns { batchJobId } immediately, then we stream progress + poll results.
-      const planUrl = "/api/batch/plan";
-
-      const resp = await xhrUpload({
-        url: planUrl,
-        formData: fd,
-        onProgress: (pct) => setUploadPct(pct)
-      });
-
-      if (!resp?.batchJobId) throw new Error(resp?.error || "No batchJobId returned.");
-      const jid = resp.batchJobId;
-
-      setBatchJobId(jid);
-
-      // cancel any prior listeners/polls
-      pollTokensRef.current.batch += 1;
-      const myBatchToken = pollTokensRef.current.batch;
-      if (typeof streamClosersRef.current.batch === 'function') {
-        try { streamClosersRef.current.batch(); } catch {}
-      }
-
-      const initialItems = hydrateBatchItems(resp.items || []);
-      setItems(initialItems);
-
-      // Help users find the Output Files section (it's below the uploader).
-      setTimeout(() => {
-        try {
-          outputRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-        } catch {}
-      }, 0);
-
-      // If the server ran synchronously, we already have plans.
-      const hasPlanNow = initialItems.some((x) => x.plan && (x.groups || []).length);
-      if (hasPlanNow) {
-        const failed = initialItems.filter((x) => !x.plan);
-        if (failed.length) {
-          setError(`${failed.length} file(s) could not be analyzed. Scroll down to see the per-file error details.`);
-        }
-        return;
-      }
-
-      // Async mode: keep UI busy, stream progress, then fetch results when done.
-      waitingAsync = true;
-
-      const pollCtl = { stopped: false };
-      const finishBatch = (fullItems) => {
-        const failed = (fullItems || []).filter((x) => !x.plan);
-        if (failed.length) {
-          setError(`${failed.length} file(s) could not be analyzed. Scroll down to see the per-file error details.`);
-        }
-      };
-
-      streamClosersRef.current.batch = listenProgress(jid, {
-        setState: setProgress,
-        onDone: async () => {
-          pollCtl.stopped = true;
-          try {
-            const doneSnap = await fetchBatchPlanResults(jid);
-            if (!doneSnap.ok) throw new Error(doneSnap.data?.error || ('Failed to fetch batch results (' + doneSnap.status + ')'));
-            const fullItems = hydrateBatchItems(doneSnap.data?.items || []);
-            setItems(fullItems);
-            finishBatch(fullItems);
-          } catch (e) {
-            setError(String(e?.message || e));
-          } finally {
-            setBusy(false);
-          }
-        }
-      });
-
-      // Fallback polling (covers environments where EventSource/proxy doesn't stream)
-      (async function pollBatch() {
-        let tries = 0;
-        let consecutiveErrors = 0;
-        const startedAt = Date.now();
-        let warnedLong = false;
-        while (!pollCtl.stopped) {
-          if (myBatchToken !== pollTokensRef.current.batch) break;
-          tries++;
-          try {
-            const snap = await fetchBatchPlanResults(jid);
-            if (!snap.ok) {
-              consecutiveErrors++;
-              // If server says job is missing or failed, stop immediately.
-              if (snap.status >= 400 && snap.status !== 202) {
-                pollCtl.stopped = true;
-                setError(snap.data?.error || ('Batch analysis failed (' + snap.status + ')'));
-                setBusy(false);
-                break;
-              }
-              if (consecutiveErrors >= 8) {
-                pollCtl.stopped = true;
-                setError(snap.data?.error || 'Batch analysis is not reachable right now.');
-                setBusy(false);
-                break;
-              }
-            } else {
-              consecutiveErrors = 0;
-              const payload = snap.data || {};
-              if (payload?.progress) setProgress(payload.progress);
-              const fullItems = hydrateBatchItems(payload.items || []);
-              setItems(fullItems);
-              if (payload?.done || payload?.progress?.done) {
-                pollCtl.stopped = true;
-                finishBatch(fullItems);
-                setBusy(false);
-                break;
-              }
-            }
-          } catch {
-            consecutiveErrors++;
-            if (consecutiveErrors >= 8) {
-              pollCtl.stopped = true;
-              setError('Batch analysis failed due to repeated network errors.');
-              setBusy(false);
-              break;
-            }
-          }
-          const elapsed = Date.now() - startedAt;
-          if (!warnedLong && elapsed >= MAX_BATCH_WAIT_MS) {
-            warnedLong = true;
-            // Non-fatal: keep polling, but let the user know why it might be slow.
-            setError(
-              "Batch analysis is still running. If this never finishes, check /api/health for tessdataEng=true, try 1–2 files, and lower IMAGE_OCR_DPI (server). We'll keep checking for results…"
-            );
-          }
-          const waitMs = Math.min(5000, 1000 + Math.floor(elapsed / 60000) * 500);
-          await new Promise((r) => setTimeout(r, waitMs));
-        }
-        // No hard stop here: keep polling. The server will eventually mark progress.done.
-      })();
-    } catch (e) {
-      setError(String(e?.message || e));
-    } finally {
-      if (!waitingAsync) setBusy(false);
+  useEffect(() => {
+    if (selectedResultIndex > Math.max(0, results.length - 1)) {
+      setSelectedResultIndex(Math.max(0, results.length - 1));
     }
-  };
+  }, [results.length, selectedResultIndex]);
 
-  // NOTE: The Output Name input is a controlled React input.
-  // If we normalize on every keystroke, React constantly rewrites the value
-  // (adding _unknownInvoice, stripping punctuation, etc.) and the cursor jumps.
-  // That makes it feel like you "can't type".
-  // So we keep a draft while typing and only normalize on blur / export / download.
-  const updateStemDraft = (fileIdx, groupIdx, draft) => {
-    setItems((prev) =>
-      prev.map((it, i) => {
-        if (i !== fileIdx) return it;
-        const groups = (it.groups || []).map((g, gi) => (gi === groupIdx ? { ...g, suggestedStemDraft: draft } : g));
-        return { ...it, groups };
-      })
-    );
-  };
+  const selectedResult = useMemo(() => {
+    if (!results.length) return null;
+    return results[selectedResultIndex] || results[0] || null;
+  }, [results, selectedResultIndex]);
 
-  const commitStemDraft = (fileIdx, groupIdx) => {
-    setItems((prev) =>
-      prev.map((it, i) => {
-        if (i !== fileIdx) return it;
-        const groups = (it.groups || []).map((g, gi) => {
-          if (gi !== groupIdx) return g;
-          const raw = String(g?.suggestedStemDraft ?? g?.suggestedStem ?? "").trim();
-          const normalized = toVendorInvoiceStem(raw) || "output_unknownInvoice";
-          const { suggestedStemDraft, ...rest } = g || {};
-          return { ...rest, suggestedStem: normalized };
-        });
-        return { ...it, groups };
-      })
-    );
-  };
-
-
-const openPreview = (jobId, pages, title) => {
-  const p = Array.isArray(pages) ? pages.join(",") : String(pages || "");
-  const url = `/api/preview?jobId=${encodeURIComponent(jobId)}&pages=${encodeURIComponent(p)}&t=${Date.now()}`;
-  setPreview({ open: true, url, title: title || "Preview" });
-};
-
-const downloadSingleOutput = async (jobId, group) => {
-  try {
-    const pages = Array.isArray(group?.pages) ? group.pages : [];
-    if (!pages.length) return;
-    const stem0 = String(group?.suggestedStemDraft ?? group?.suggestedStem ?? group?.stem ?? "OUTPUT").trim() || "OUTPUT";
-    const stem = toVendorInvoiceStem(stem0) || "output_unknownInvoice";
-    const filename = stem.toLowerCase().endsWith(".pdf") ? stem : `${stem}.pdf`;
-
-    const url = buildOutputDownloadUrl(jobId, pages, stem);
-    const r = await fetch(url, { cache: "no-store" });
-    if (!r.ok) {
-      const text = await r.text().catch(() => "");
-      let msg = `Download failed (${r.status})`;
-      try {
-        const j = JSON.parse(text);
-        msg = j?.error || msg;
-      } catch {
-        if (text) msg = text.slice(0, 240);
-      }
-      throw new Error(msg);
-    }
-
-    const blob = await r.blob();
-    downloadBlob(blob, filename);
-  } catch (e) {
-    setError(String(e?.message || e));
+  function handleChooseFile() {
+    fileInputRef.current?.click();
   }
-};
 
-const closePreview = () => setPreview({ open: false, url: "", title: "" });
-const updatePages = (fileIdx, groupIdx, pagesText) => {
-  const pages = parsePages(pagesText);
-  setItems((prev) =>
-    prev.map((it, i) => {
-      if (i !== fileIdx) return it;
-      const groups = (it.groups || []).map((g, gi) => (gi === groupIdx ? { ...g, pages } : g));
-      return { ...it, groups };
-    })
-  );
-};
+  function handleFiles(fileList) {
+    const file = fileList?.[0] || null;
+    setSelectedFile(file);
+    setStatusMessage(file ? `Selected ${file.name}` : "");
+  }
 
+  function handleInputChange(e) {
+    handleFiles(e.target.files);
+  }
 
-const resetFileToOcrPlan = (fileIdx) => {
-  setItems((prev) =>
-    prev.map((it, i) => {
-      if (i !== fileIdx) return it;
-      const plan = it.plan || null;
-      const groups = dedupeStems((plan?.groups || []).map((g) => ({ ...g, suggestedStem: g.suggestedStem || g.stem || "OUTPUT" })));
-      return { ...it, groups };
-    })
-  );
-};
+  function handleDragOver(e) {
+    e.preventDefault();
+    setDragActive(true);
+  }
 
-const resplitFileToSingles = (fileIdx) => {
-  setItems((prev) =>
-    prev.map((it, i) => {
-      if (i !== fileIdx) return it;
-      const pages = it.plan?.pages || [];
-const groups = pages.map((p, idx) => {
-const vendorNorm =
-  resolveVendorName(g, g.VENDORNAME || g.vendorNorm || g.vendorName || "") ||
-  g.VENDORNAME ||
-  g.vendorNorm ||
-  "UNKNOWN_VENDOR";
-    return {
-    groupIndex: idx + 1,
-    vendorNorm: resolvedVendor || p.vendorNorm || "UNKNOWN_VENDOR",
-    // rest unchanged
-  };
-});
-      return { ...it, groups: dedupeStems(groups) };
-    })
-  );
-};
+  function handleDragLeave(e) {
+    e.preventDefault();
+    setDragActive(false);
+  }
 
-const splitGroupIntoSingles = (fileIdx, groupIdx) => {
-  setItems((prev) =>
-    prev.map((it, i) => {
-      if (i !== fileIdx) return it;
-      const groups = Array.isArray(it.groups) ? [...it.groups] : [];
-      const g = groups[groupIdx];
-      if (!g || !Array.isArray(g.pages) || g.pages.length < 2) return it;
-      const vendorNorm = resolveVendorName(g, g.vendorNorm || g.vendorName || "") || g.vendorNorm || "UNKNOWN_VENDOR";
-      const invoiceNumber = g.invoiceNumber || "";
-      const [p1, p2] = g.pages;
-      const g1 = { ...g, vendorNorm, pages: [p1], suggestedStem: defaultStem(vendorNorm, invoiceNumber) };
-      const g2 = { ...g, vendorNorm, pages: [p2], suggestedStem: defaultStem(vendorNorm, invoiceNumber) };
-      groups.splice(groupIdx, 1, g1, g2);
-      return { ...it, groups: dedupeStems(groups) };
-    })
-  );
-};
+  function handleDrop(e) {
+    e.preventDefault();
+    setDragActive(false);
+    handleFiles(e.dataTransfer?.files);
+  }
 
-
-  const exportBatchZip = async () => {
-    if (!canExport) return;
-    setBusy(true);
-    setError("");
+  async function handlePlan() {
+    if (!selectedFile) {
+      window.alert("Choose a PDF first.");
+      return;
+    }
 
     try {
-      listenProgress(batchJobId);
+      setPlanning(true);
+      setStatusMessage("Uploading file and analyzing pages...");
 
-      const payload = {
-        batchJobId,
-        items: items.map((it) => ({
-          jobId: it.jobId,
-          sourceName: it.sourceName,
-          folderName: baseName(it.sourceName),
-          groups: (it.groups || []).map((g) => {
-            const raw = String(g?.suggestedStemDraft ?? g?.suggestedStem ?? g?.stem ?? "").trim();
-            const suggestedStem = toVendorInvoiceStem(raw) || "output_unknownInvoice";
-            const { suggestedStemDraft, ...rest } = g || {};
-            return { ...rest, suggestedStem };
-          })
-        }))
-      };
+      const formData = new FormData();
+      formData.append("file", selectedFile);
 
-      const resp = await fetch("/api/batch/split", {
+      const res = await fetch("/api/plan", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        body: formData,
       });
 
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({}));
-        throw new Error(data?.error || `Split failed (${resp.status})`);
+      const data = await parseJsonSafe(res);
+
+      if (!res.ok) {
+        throw new Error(data?.error || `Plan request failed: ${res.status}`);
       }
 
-      const blob = await resp.blob();
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-      const name = files.length === 1 ? `${baseName(files[0].name)}_OUTPUT.zip` : `BATCH_OUTPUT_${stamp}.zip`;
-      downloadBlob(blob, name);
-    } catch (e) {
-      setError(String(e?.message || e));
+      const nextResults = Array.isArray(data?.results) ? data.results : [];
+
+      setResults(nextResults);
+      setSelectedResultIndex(0);
+      setNewVendorReviews(
+        Array.isArray(data?.newVendorReviews) ? data.newVendorReviews : []
+      );
+      setStatusMessage(
+        `Finished analyzing ${data?.totalPages || 0} page(s) from ${
+          data?.fileName || selectedFile.name
+        }. Click any row to preview that page.`
+      );
+    } catch (err) {
+      console.error(err);
+      setStatusMessage("");
+      window.alert(err?.message || "Failed to process file.");
     } finally {
-      setBusy(false);
+      setPlanning(false);
     }
-  };
+  }
+
+  async function reanalyzeCurrentFile(options = {}) {
+    const keepPageNumber = options.keepPageNumber ?? null;
+
+    if (!selectedFile) return;
+
+    try {
+      setReanalyzing(true);
+      setStatusMessage("Re-evaluating PDF using the updated template collection...");
+
+      const formData = new FormData();
+      formData.append("file", selectedFile);
+
+      const res = await fetch("/api/plan", {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await parseJsonSafe(res);
+
+      if (!res.ok) {
+        throw new Error(data?.error || `Re-evaluation failed: ${res.status}`);
+      }
+
+      const nextResults = Array.isArray(data?.results) ? data.results : [];
+      const nextReviews = Array.isArray(data?.newVendorReviews)
+        ? data.newVendorReviews
+        : [];
+
+      setResults(nextResults);
+      setNewVendorReviews(nextReviews);
+
+      if (keepPageNumber != null && nextResults.length) {
+        const nextIndex = nextResults.findIndex(
+          (row) => Number(row.pageNumber) === Number(keepPageNumber)
+        );
+        setSelectedResultIndex(nextIndex >= 0 ? nextIndex : 0);
+      } else {
+        setSelectedResultIndex(0);
+      }
+
+      setStatusMessage(
+        `Re-evaluation finished. ${nextResults.length} page(s) checked against the updated template collection.`
+      );
+    } catch (err) {
+      console.error(err);
+      setStatusMessage("");
+      window.alert(err?.message || "Failed to re-evaluate the PDF.");
+    } finally {
+      setReanalyzing(false);
+    }
+  }
+
+  async function handleSaveVendorTemplate(payload) {
+    try {
+      setSavingVendorTemplate(true);
+
+      const res = await fetch("/api/vendor-template", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await parseJsonSafe(res);
+
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to save vendor template.");
+      }
+
+      setStatusMessage(
+        `Saved template for ${payload.vendorName}. Re-evaluating current PDF...`
+      );
+
+      await reanalyzeCurrentFile({
+        keepPageNumber: payload.pageNumber,
+      });
+    } catch (err) {
+      console.error(err);
+      window.alert(err?.message || "Failed to save vendor template.");
+    } finally {
+      setSavingVendorTemplate(false);
+    }
+  }
+
+  async function handleDownloadRow(row) {
+    if (!selectedFile) {
+      window.alert("Choose a PDF first.");
+      return;
+    }
+
+    try {
+      setStatusMessage(
+        `Preparing ${row.officialFileName || "individual download"}...`
+      );
+
+      const formData = new FormData();
+      formData.append("file", selectedFile);
+      formData.append("pageNumber", String(row.pageNumber || ""));
+      formData.append("vendorName", row.vendorName || "");
+      formData.append("invoiceNumber", row.invoiceNumber || "");
+
+      const res = await fetch("/api/download-page", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const data = await parseJsonSafe(res);
+        throw new Error(
+          data?.error || `Download request failed with status ${res.status}.`
+        );
+      }
+
+      const blob = await res.blob();
+      const disposition = res.headers.get("Content-Disposition");
+      const downloadName =
+        getFileNameFromDisposition(disposition) ||
+        row.officialFileName ||
+        "download.pdf";
+
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = downloadName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+
+      setStatusMessage(`Downloaded ${downloadName}.`);
+    } catch (err) {
+      console.error(err);
+      setStatusMessage("");
+      window.alert(err?.message || "Failed to download individual PDF.");
+    }
+  }
+
+  function resetAll() {
+    setSelectedFile(null);
+    setResults([]);
+    setSelectedResultIndex(0);
+    setNewVendorReviews([]);
+    setStatusMessage("");
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  const pageCount = results.length;
+  const newVendorCount = newVendorReviews.length;
+
+  if (booting) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          background:
+            "radial-gradient(circle at top, #12314a 0%, #08131d 55%, #050b12 100%)",
+          color: "#e7f6ff",
+          display: "grid",
+          placeItems: "center",
+          padding: 24,
+          fontFamily:
+            'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        }}
+      >
+        <div
+          style={{
+            width: "100%",
+            maxWidth: 520,
+            borderRadius: 22,
+            padding: 28,
+            background: "rgba(10, 22, 34, 0.88)",
+            border: "1px solid rgba(90, 143, 191, 0.22)",
+            boxShadow: "0 18px 50px rgba(0, 0, 0, 0.32)",
+            textAlign: "center",
+          }}
+        >
+          <div style={{ fontSize: 26, fontWeight: 900, marginBottom: 12 }}>
+            Project Invoice
+          </div>
+          <div style={{ color: "#9fc3df", fontSize: 16 }}>
+            Loading application...
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (bootError) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          background:
+            "radial-gradient(circle at top, #12314a 0%, #08131d 55%, #050b12 100%)",
+          color: "#e7f6ff",
+          padding: 24,
+          fontFamily:
+            'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        }}
+      >
+        <div
+          style={{
+            maxWidth: 900,
+            margin: "0 auto",
+            borderRadius: 22,
+            padding: 28,
+            background: "rgba(10, 22, 34, 0.9)",
+            border: "1px solid rgba(255, 107, 107, 0.22)",
+            boxShadow: "0 18px 50px rgba(0, 0, 0, 0.32)",
+          }}
+        >
+          <h1 style={{ marginTop: 0, marginBottom: 12 }}>App failed to start</h1>
+          <div style={{ color: "#ffd6d6", marginBottom: 12 }}>{bootError}</div>
+          <div style={{ color: "#9fc3df", lineHeight: 1.7 }}>
+            Make sure your backend is running and that <strong>/api/health</strong>{" "}
+            returns JSON.
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="container" onDragOver={(e) => e.preventDefault()} onDrop={(e) => e.preventDefault()}>
-      <div className="header">
-        <div>
-          <div className="title">Project Invoice</div>
-          <div className="subtitle">Upload one or many PDFs → detect Vendor + Invoice # → split → download ZIP</div>
-        </div>
-        <div className="pill">
-          <span>Backend:</span>
-          <a href="/api/health" target="_blank" rel="noreferrer">
-            /api/health
-          </a>
-        </div>
-      </div>
-
-      <div className="card">
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="application/pdf"
-          multiple
-          style={{ display: "none" }}
-          onChange={(e) => onPickFiles(e.target.files)}
-        />
-
-        <div
-          className={`dropzone ${batchDnD.active ? "dropzoneActive" : ""}`}
-          onClick={openPicker}
-          onDrop={onDrop}
-          onDragEnter={batchDnD.onDragEnter}
-          onDragLeave={batchDnD.onDragLeave}
-          onDragOver={batchDnD.onDragOver}
+    <div
+      style={{
+        minHeight: "100vh",
+        background:
+          "radial-gradient(circle at top, #12314a 0%, #08131d 55%, #050b12 100%)",
+        color: "#e7f6ff",
+        padding: 24,
+        fontFamily:
+          'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      }}
+    >
+      <div style={{ maxWidth: 1400, margin: "0 auto" }}>
+        <header
+          style={{
+            marginBottom: 24,
+            borderRadius: 24,
+            padding: 24,
+            background: "rgba(10, 22, 34, 0.88)",
+            border: "1px solid rgba(90, 143, 191, 0.22)",
+            boxShadow: "0 18px 50px rgba(0, 0, 0, 0.28)",
+          }}
         >
-          <div>
-            <strong>
-              {files.length === 0
-                ? "Drag & drop PDF(s) here"
-                : files.length === 1
-                ? files[0].name
-                : `${files.length} files selected`}
-            </strong>
-            <div className="hint">or click to choose file(s)</div>
-            {files.length > 0 && (
-              <div className="hint small">
-                Total size: {(files.reduce((sum, f) => sum + (f?.size || 0), 0) / 1024).toFixed(0)} KB
-              </div>
-            )}
-          </div>
-        </div>
-
-        {files.length > 1 && (
-          <div className="footer" style={{ marginTop: 10 }}>
-            {files.slice(0, 6).map((f) => (
-              <div key={f.name} className="small">
-                • {f.name}
-              </div>
-            ))}
-            {files.length > 6 && <div className="small">…and {files.length - 6} more</div>}
-          </div>
-        )}
-
-        <div className="row" style={{ marginTop: 14, alignItems: "center" }}>
-          <button className="btn btnPrimary" onClick={runBatchPlan} disabled={!canAnalyze}>
-            {busy ? "Working…" : "Analyze & Suggest Splits"}
-          </button>
-          <button className="btn" onClick={exportBatchZip} disabled={!canExport}>
-            Download ZIP
-          </button>
-
-          {progress && (
-            <span className="pill">
-              {progress.stage || "…"}
-              {progress.doneGroups && progress.totalGroups ? ` • ${progress.doneGroups}/${progress.totalGroups}` : ""}
-            </span>
-          )}
-        </div>
-
-        {(busy || uploadPct > 0) && (
-          <div className="progressWrap" aria-label="progress">
-            <div className="progressBar" style={{ width: formatPct(uploadPct) }} />
-          </div>
-        )}
-        {(busy || uploadPct > 0) && (
-          <div className="small" style={{ marginTop: 8 }}>
-            Upload: {formatPct(uploadPct)}
-            {progress?.message ? ` • ${progress.message}` : ""}
-          </div>
-        )}
-
-        {error && <div className="error">Error: {error}</div>}
-
-        {vendorResults.some((it) => it.vendors.length > 0) && (
-          <div className="card" style={{ marginTop: 16 }}>
-            <div style={{ fontWeight: 800, fontSize: 16 }}>Detected Vendors</div>
-            <div className="small" style={{ marginTop: 6 }}>
-              These vendor names are generated from the analyzed invoice data using repeatable pattern matching, so the same vendor names can be surfaced again on future uploads.
-            </div>
-
-            {vendorResults.map((it) =>
-              it.vendors.length ? (
-                <div key={`vendors_${it.jobId}`} style={{ marginTop: 12 }}>
-                  <div style={{ fontWeight: 700 }}>{it.sourceName}</div>
-                  <div className="small" style={{ marginTop: 6 }}>
-                    {it.vendors.map((v) => `p.${v.page || "?"}: ${v.name}`).join(" • ")}
-                  </div>
-                </div>
-              ) : null
-            )}
-          </div>
-        )}
-
-        {items.length > 0 && (
-          <div className="footer">
-Files analyzed: {items.length} • Total suggested invoices:{" "}
-{(() => {
-  const pending = items.some((it) => !it.plan && !it.itemError);
-  if (pending) return <b>calculating…</b>;
-  return items.reduce((sum, it) => sum + ((it.plan?.groups || []).length || 0), 0);
-})()}
-{items.reduce((sum, it) => sum + (Number(it.plan?.vendorsAdded || 0) || 0), 0) > 0 && (
-  <>
-    {" "}
-    • <b>New vendors added:</b>{" "}
-    {items.reduce((sum, it) => sum + (Number(it.plan?.vendorsAdded || 0) || 0), 0)}
-  </>
-)}
-          </div>
-        )}
-      </div>
-
-      <div className="card" style={{ marginTop: 16 }} ref={outputRef}>
-          <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 14,
+              alignItems: "flex-start",
+              flexWrap: "wrap",
+            }}
+          >
             <div>
-              <div style={{ fontWeight: 800, fontSize: 16 }}>Output Files</div>
-              <div className="small">
-                Default format is <b>Vendor Name_InvoiceNumber</b> (vendor keeps spaces, one underscore before invoice #; invoice keeps an optional hyphen). You can edit stems below. Batch ZIP will include a folder per input PDF.
-              </div>
+              <h1
+                style={{
+                  margin: 0,
+                  fontSize: 34,
+                  lineHeight: 1.1,
+                  color: "#eef8ff",
+                }}
+              >
+                Project Invoice
+              </h1>
+              <p
+                style={{
+                  margin: "10px 0 0",
+                  color: "#9fc3df",
+                  fontSize: 16,
+                  lineHeight: 1.6,
+                }}
+              >
+                Upload an invoice PDF, extract vendors and invoice numbers, inspect
+                each page preview, train new templates, and download each page as
+                VENDOR_INVOICENUMBER.pdf.
+              </p>
             </div>
-            <div className="pill">Tip: Keep invoice numbers digits-only</div>
-          </div>
 
-          {items.length === 0 && (
-            <div className="footer" style={{ marginTop: 12 }}>
-              <div style={{ fontWeight: 700 }}>No output files yet.</div>
-              <div className="small" style={{ marginTop: 6 }}>
-                To generate outputs: upload PDF(s) in the <b>Drag &amp; drop PDF(s)</b> section above, click <b>Analyze &amp; Suggest Splits</b>, then come back here to <b>Preview</b> or <b>Download</b>.
-              </div>
-            </div>
-          )}
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <StatusPill tone={serverReady ? "success" : "warning"}>
+                {serverReady ? "Backend Ready" : "Backend Not Ready"}
+              </StatusPill>
 
-          {items.map((it, fileIdx) => (
-            <div key={it.jobId} style={{ marginTop: 14 }}>
-              <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-                <div style={{ fontWeight: 800 }}>
-                  {it.sourceName}{" "}
-                  <span className="small" style={{ fontWeight: 600 }}>
-                    (job: {it.jobId})
-                  </span>
-                </div>
-                <div className="row" style={{ justifyContent: "flex-end", alignItems: "center" }}>
-                  <button
-                    className="btn"
-                    type="button"
-                    onClick={() => {
-                      const total = Number(it?.plan?.pages?.length || 0);
-                      const n = Math.max(1, Math.min(4, total || 1));
-                      const pages = Array.from({ length: n }, (_, i) => i + 1);
-                      openPreview(it.jobId, pages, `${it.sourceName} • Preview (first ${n})`);
-                    }}
-                    disabled={busy || !it.plan}
-                    title="Preview the first few pages of the original PDF"
-                  >
-                    Preview PDF
-                  </button>
-                  <button className="btn" type="button" onClick={() => resetFileToOcrPlan(fileIdx)} disabled={busy}>
-                    Reset
-                  </button>
-                  <button className="btn btnPrimary" type="button" onClick={() => resplitFileToSingles(fileIdx)} disabled={busy}>
-                    Resplit (1/page)
-                  </button>
-
-                  <span className="pill">
-                    {it.plan?.pages?.length || 0} pages • {it.groups?.length || 0} outputs {Number(it.plan?.vendorsAdded || 0) > 0 ? ` • new vendors: ${Number(it.plan?.vendorsAdded || 0)}` : ""}
-                    {Object.keys(splitSelection?.[it.jobId] || {}).length ? ` • selected: ${Object.keys(splitSelection?.[it.jobId] || {}).length}` : ""}
-                  </span>
-                </div>
-              </div>
-
-              {(it.ocrApplied === false && it.ocrError) && (
-                <div className="small" style={{ marginTop: 6 }}>
-                  <b>OCRmyPDF:</b> not applied ({String(it.ocrError).slice(0, 180)})
-                </div>
-              )}
-
-              {(() => {
-                const warns = it.plan?.warnings || [];
-                const critical = warns.find((w) =>
-                  ["IMAGE_OCR_FAILED", "TESSDATA_MISSING", "TESSDATA_LOCAL_MISSING"].includes(String(w?.code || ""))
-                );
-                if (!critical) return null;
-                return (
-                  <div className="error" style={{ marginTop: 10 }}>
-                    <div style={{ fontWeight: 800 }}>OCR could not read this PDF</div>
-                    <div className="small" style={{ marginTop: 6 }}>
-                      {critical.message}
-                    </div>
-                    <div className="small" style={{ marginTop: 6 }}>
-                      Fix: open <a href="/api/health" target="_blank" rel="noreferrer">/api/health</a> and confirm <b>canvas=true</b> and <b>tessdataEng=true</b>. If tessdata is missing, run:
-                      <div style={{ marginTop: 6 }}>
-                        <code>server/scripts/download-eng-tessdata.ps1</code> (Windows) or <code>server/scripts/download-eng-tessdata.sh</code> (mac/linux)
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {it.plan?.warnings?.length ? (
-                <details style={{ marginTop: 8 }}>
-                  <summary className="small">Show analysis warnings</summary>
-                  <pre className="small" style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(it.plan.warnings, null, 2)}</pre>
-                </details>
+              {pageCount > 0 ? (
+                <StatusPill tone="info">{pageCount} page(s) analyzed</StatusPill>
               ) : null}
 
-              {it.itemError && (
-                <div className="error" style={{ marginTop: 10 }}>
-                  <div style={{ fontWeight: 800 }}>This file could not be analyzed.</div>
-                  <pre className="small" style={{ whiteSpace: "pre-wrap" }}>{it.itemError}</pre>
-                </div>
-              )}
+              {newVendorCount > 0 ? (
+                <StatusPill tone="warning">
+                  {newVendorCount} new vendor review item(s)
+                </StatusPill>
+              ) : null}
+            </div>
+          </div>
+        </header>
 
-              {!it.itemError && !it.plan && (
-                <div className="small" style={{ marginTop: 10 }}>
-                  Processing… (waiting for analysis results)
-                </div>
-              )}
+        <section
+          style={{
+            borderRadius: 24,
+            padding: 24,
+            background: "rgba(10, 22, 34, 0.88)",
+            border: "1px solid rgba(90, 143, 191, 0.22)",
+            boxShadow: "0 18px 50px rgba(0, 0, 0, 0.28)",
+          }}
+        >
+          <div
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            style={{
+              borderRadius: 20,
+              border: dragActive
+                ? "2px solid rgba(122, 197, 255, 0.8)"
+                : "2px dashed rgba(122, 197, 255, 0.35)",
+              background: dragActive
+                ? "rgba(35, 76, 113, 0.32)"
+                : "rgba(9, 19, 29, 0.76)",
+              padding: 28,
+              textAlign: "center",
+              transition: "all 0.15s ease",
+            }}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".pdf,application/pdf"
+              onChange={handleInputChange}
+              style={{ display: "none" }}
+            />
 
-              {!it.itemError && it.plan && (it.groups || []).length === 0 && (
-                <div className="error" style={{ marginTop: 10 }}>
-                  No output groups were produced for this file. (This is unexpected — check the warnings above.)
-                </div>
-              )}
+            <div
+              style={{
+                fontSize: 22,
+                fontWeight: 900,
+                color: "#eef8ff",
+                marginBottom: 10,
+              }}
+            >
+              Drag and drop your invoice PDF here
+            </div>
 
-              {!it.itemError && (
-                <table className="table">
+            <div
+              style={{
+                color: "#cbe6fb",
+                fontSize: 15,
+                marginBottom: 16,
+              }}
+            >
+              Or choose a file manually and analyze it.
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "center",
+                gap: 12,
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                type="button"
+                onClick={handleChooseFile}
+                disabled={planning || reanalyzing || savingVendorTemplate}
+                style={{
+                  padding: "12px 18px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(110, 166, 214, 0.35)",
+                  background: "#1d6fa5",
+                  color: "#f4fbff",
+                  cursor:
+                    planning || reanalyzing || savingVendorTemplate
+                      ? "not-allowed"
+                      : "pointer",
+                  fontWeight: 800,
+                  opacity:
+                    planning || reanalyzing || savingVendorTemplate ? 0.7 : 1,
+                }}
+              >
+                Choose PDF
+              </button>
+
+              <button
+                type="button"
+                onClick={handlePlan}
+                disabled={!selectedFile || planning || reanalyzing}
+                style={{
+                  padding: "12px 18px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(110, 166, 214, 0.35)",
+                  background:
+                    !selectedFile || planning || reanalyzing
+                      ? "#31506a"
+                      : "#145884",
+                  color: "#f4fbff",
+                  cursor:
+                    !selectedFile || planning || reanalyzing
+                      ? "not-allowed"
+                      : "pointer",
+                  fontWeight: 800,
+                }}
+              >
+                {planning
+                  ? "Analyzing..."
+                  : reanalyzing
+                  ? "Re-evaluating..."
+                  : "Analyze File"}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => reanalyzeCurrentFile()}
+                disabled={
+                  !selectedFile || planning || reanalyzing || savingVendorTemplate
+                }
+                style={{
+                  padding: "12px 18px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(110, 166, 214, 0.35)",
+                  background:
+                    !selectedFile || planning || reanalyzing || savingVendorTemplate
+                      ? "#31506a"
+                      : "#174060",
+                  color: "#f4fbff",
+                  cursor:
+                    !selectedFile || planning || reanalyzing || savingVendorTemplate
+                      ? "not-allowed"
+                      : "pointer",
+                  fontWeight: 800,
+                }}
+              >
+                {reanalyzing ? "Re-evaluating..." : "Re-evaluate PDF"}
+              </button>
+
+              <button
+                type="button"
+                onClick={resetAll}
+                disabled={planning || reanalyzing || savingVendorTemplate}
+                style={{
+                  padding: "12px 18px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(110, 166, 214, 0.35)",
+                  background: "#0f2538",
+                  color: "#e5f4ff",
+                  cursor:
+                    planning || reanalyzing || savingVendorTemplate
+                      ? "not-allowed"
+                      : "pointer",
+                  fontWeight: 700,
+                }}
+              >
+                Reset
+              </button>
+            </div>
+
+            {selectedFile ? (
+              <div
+                style={{
+                  marginTop: 16,
+                  color: "#d7eeff",
+                  fontWeight: 700,
+                  lineHeight: 1.7,
+                }}
+              >
+                Selected: {selectedFile.name} ({formatBytes(selectedFile.size)})
+              </div>
+            ) : (
+              <div style={{ marginTop: 16, color: "#9fc3df" }}>
+                No file selected yet.
+              </div>
+            )}
+
+            {statusMessage ? (
+              <div
+                style={{
+                  marginTop: 16,
+                  color: "#d7eeff",
+                  background: "rgba(79, 172, 254, 0.12)",
+                  border: "1px solid rgba(79, 172, 254, 0.22)",
+                  borderRadius: 12,
+                  padding: "12px 14px",
+                }}
+              >
+                {statusMessage}
+              </div>
+            ) : null}
+          </div>
+        </section>
+
+        {results.length > 0 ? (
+          <section
+            style={{
+              marginTop: 24,
+              borderRadius: 24,
+              padding: 24,
+              background: "rgba(10, 22, 34, 0.88)",
+              border: "1px solid rgba(90, 143, 191, 0.22)",
+              boxShadow: "0 18px 50px rgba(0, 0, 0, 0.28)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 12,
+                flexWrap: "wrap",
+                alignItems: "center",
+                marginBottom: 16,
+              }}
+            >
+              <div>
+                <h2 style={{ margin: 0, fontSize: 24, color: "#eef8ff" }}>
+                  Analysis Results
+                </h2>
+                <div style={{ marginTop: 6, color: "#9fc3df" }}>
+                  Click any row to preview that page and inspect where the vendor
+                  name and invoice number appear.
+                </div>
+              </div>
+            </div>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(680px, 1fr) minmax(340px, 0.95fr)",
+                gap: 18,
+                alignItems: "start",
+              }}
+            >
+              <div
+                style={{
+                  overflowX: "auto",
+                  borderRadius: 18,
+                  border: "1px solid rgba(85, 140, 190, 0.24)",
+                }}
+              >
+                <table
+                  style={{
+                    width: "100%",
+                    borderCollapse: "collapse",
+                    minWidth: 1180,
+                    background: "#09131d",
+                  }}
+                >
                   <thead>
-                    <tr>
-                      <th style={{ width: 60 }}>#</th>
-                      <th>Output name (vendor_invoiceNumber)</th>
-                      <th style={{ width: 220 }}>Pages (editable)</th>
-                      <th style={{ width: 300 }}>Actions</th>
+                    <tr style={{ background: "#10273a" }}>
+                      <th style={thStyle}>Preview</th>
+                      <th style={thStyle}>Page</th>
+                      <th style={thStyle}>Vendor</th>
+                      <th style={thStyle}>Normalized Vendor</th>
+                      <th style={thStyle}>Invoice Number</th>
+                      <th style={thStyle}>Official File Name</th>
+                      <th style={thStyle}>Template</th>
+                      <th style={thStyle}>Match Score</th>
+                      <th style={thStyle}>Download</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {(it.groups || []).map((g, groupIdx) => (
-                      <tr key={`${it.jobId}_${groupIdx}`}>
-                        <td>{groupIdx + 1}</td>
-                        <td>
-                          <input
-                            className="input"
-                            value={g.suggestedStemDraft ?? g.suggestedStem ?? ""}
-                            onChange={(e) => updateStemDraft(fileIdx, groupIdx, e.target.value)}
-                            onBlur={() => commitStemDraft(fileIdx, groupIdx)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                e.preventDefault();
-                                e.currentTarget.blur();
-                              }
-                            }}
-                            placeholder="e.g. PST Abstracting Inc 12345"
-                          />
-                          <div className="small" style={{ marginTop: 6 }}>
-                            {(() => {
-                              const raw = String(g?.suggestedStemDraft ?? g?.suggestedStem ?? "").trim();
-                              const stem = toVendorInvoiceStem(raw) || "OUTPUT";
-                              return (
-                                <>
-                                  Output: <code>{stem}.pdf</code> (in folder <code>{baseName(it.sourceName)}</code>)
-                                </>
-                              );
-                            })()}
-                          </div>
-                        </td>
-                        <td>
-                          <input
-                            className="input"
-                            value={Array.isArray(g.pages) ? g.pages.join(",") : ""}
-                            onChange={(e) => updatePages(fileIdx, groupIdx, e.target.value)}
-                            placeholder="e.g. 5 or 5,6"
-                          />
-                          <div className="small" style={{ marginTop: 6 }}>
-                            Current: {Array.isArray(g.pages) ? g.pages.join(", ") : ""} • ({Array.isArray(g.pages) ? g.pages.length : 0} page(s), max 2)
-                          </div>
-                        </td>
-                        <td>
-                          <button
-                            className="btn"
-                            type="button"
-                            onClick={() => openPreview(it.jobId, g.pages, `${it.sourceName} • #${groupIdx + 1}`)}
-                          >
-                            Preview
-                          </button>
-                          <button
-                            className="btn btnPrimary"
-                            type="button"
-                            onClick={() => downloadSingleOutput(it.jobId, g)}
-                            disabled={!Array.isArray(g.pages) || !g.pages.length}
-                            title="Download this output PDF only"
-                          >
-                            Download
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {results.map((row, index) => {
+                      const isSelected = index === selectedResultIndex;
+
+                      return (
+                        <tr
+                          key={`${row.pageNumber}_${index}`}
+                          onClick={() => setSelectedResultIndex(index)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              setSelectedResultIndex(index);
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                          aria-pressed={isSelected}
+                          style={{
+                            borderTop: "1px solid rgba(85, 140, 190, 0.14)",
+                            cursor: "pointer",
+                            background: isSelected
+                              ? "rgba(32, 82, 121, 0.34)"
+                              : "transparent",
+                            outline: "none",
+                          }}
+                        >
+                          <td style={tdStyle}>
+                            {row.previewUrl ? (
+                              <img
+                                src={row.previewUrl}
+                                alt={`Page ${row.pageNumber}`}
+                                style={{
+                                  width: 56,
+                                  height: 72,
+                                  objectFit: "cover",
+                                  borderRadius: 8,
+                                  display: "block",
+                                  border: "1px solid rgba(110, 166, 214, 0.28)",
+                                }}
+                              />
+                            ) : (
+                              <div
+                                style={{
+                                  width: 56,
+                                  height: 72,
+                                  display: "grid",
+                                  placeItems: "center",
+                                  borderRadius: 8,
+                                  border: "1px solid rgba(110, 166, 214, 0.18)",
+                                  color: "#7da4c2",
+                                  fontSize: 11,
+                                  textAlign: "center",
+                                  padding: 4,
+                                }}
+                              >
+                                No preview
+                              </div>
+                            )}
+                          </td>
+                          <td style={tdStyle}>{row.pageNumber ?? "-"}</td>
+                          <td style={tdStyle}>{row.vendorName || "-"}</td>
+                          <td style={tdStyle}>{row.normalizedVendor || "-"}</td>
+                          <td style={tdStyle}>{row.invoiceNumber || "-"}</td>
+                          <td style={tdStyle}>
+                            <span style={{ color: "#cbe6fb", wordBreak: "break-word" }}>
+                              {row.officialFileName || "-"}
+                            </span>
+                          </td>
+                          <td style={tdStyle}>
+                            {row.hasSavedTemplate ? (
+                              <span style={{ color: "#98f0be", fontWeight: 800 }}>
+                                Yes
+                              </span>
+                            ) : (
+                              <span style={{ color: "#ffd792", fontWeight: 800 }}>
+                                No
+                              </span>
+                            )}
+                          </td>
+                          <td style={tdStyle}>{row.matchScore ?? 0}</td>
+                          <td style={tdStyle}>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDownloadRow(row);
+                              }}
+                              style={{
+                                padding: "10px 14px",
+                                borderRadius: 10,
+                                border: "1px solid rgba(110, 166, 214, 0.35)",
+                                background: "#174060",
+                                color: "#f4fbff",
+                                cursor: "pointer",
+                                fontWeight: 800,
+                              }}
+                            >
+                              Download
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
-              )}
+              </div>
+
+              <ResultPreviewPanel row={selectedResult} onDownload={handleDownloadRow} />
             </div>
-          ))}
+          </section>
+        ) : null}
 
-<div className="row" style={{ justifyContent: "flex-end", marginTop: 16 }}>
-  <button className="btn btnPrimary" onClick={exportBatchZip} disabled={!canExport}>
-    Mass Download (ZIP)
-  </button>
-</div>
+        <VendorFieldTrainer
+          items={newVendorReviews}
+          saving={savingVendorTemplate}
+          onSave={handleSaveVendorTemplate}
+          onClose={() => setNewVendorReviews([])}
+        />
 
-        </div>
-{preview.open && (
-  <div className="modalOverlay" role="dialog" aria-modal="true" onMouseDown={closePreview}>
-    <div className="modalCard" onMouseDown={(e) => e.stopPropagation()}>
-      <div className="modalHeader">
-        <div className="modalTitle">{preview.title || "Preview"}</div>
-        <div className="row" style={{ justifyContent: "flex-end" }}>
-          <a className="btn" href={preview.url} target="_blank" rel="noreferrer">Open</a>
-          <button className="btn btnPrimary" onClick={closePreview} type="button">Close</button>
-        </div>
+        <footer
+          style={{
+            marginTop: 24,
+            borderRadius: 20,
+            padding: 18,
+            background: "rgba(10, 22, 34, 0.74)",
+            border: "1px solid rgba(90, 143, 191, 0.18)",
+            color: "#9fc3df",
+            fontSize: 13,
+            lineHeight: 1.7,
+          }}
+        >
+          <div>
+            Backend status:{" "}
+            <strong style={{ color: "#e7f6ff" }}>
+              {serverReady ? "connected" : "not connected"}
+            </strong>
+          </div>
+          {serverInfo ? (
+            <div>
+              Health route responded successfully.
+              {serverInfo.clientOrigin
+                ? ` Allowed origin: ${serverInfo.clientOrigin}.`
+                : ""}
+            </div>
+          ) : null}
+        </footer>
       </div>
-      <div className="modalBody">
-        <iframe title="PDF Preview" src={preview.url} className="modalFrame" />
-      </div>
-      <div className="small" style={{ marginTop: 10 }}>
-        If grouping looks wrong: check **Split** for the rows you want to separate, then click **Okay** for that file. You can also use **Resplit (1/page)** or edit pages manually (max 2).
-      </div>
-    </div>
-  </div>
-)}
-
-
     </div>
   );
 }
+
+const thStyle = {
+  textAlign: "left",
+  padding: "14px 16px",
+  color: "#d7eeff",
+  fontSize: 13,
+  letterSpacing: "0.02em",
+};
+
+const tdStyle = {
+  padding: "14px 16px",
+  color: "#cbe6fb",
+  fontSize: 14,
+  verticalAlign: "top",
+};

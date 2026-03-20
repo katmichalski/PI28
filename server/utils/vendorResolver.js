@@ -359,12 +359,22 @@ function buildVendorOutputStem(group, vendorName) {
 
 function applyVendorToGroup(group, vendorLike) {
   const next = { ...(group || {}) };
-  const vendorNorm = String(
-    vendorLike?.vendorNorm || vendorLike?.vendorRaw || vendorLike?.canonical || ""
-  ).trim();
-  const vendorRaw = String(
-    vendorLike?.vendorRaw || vendorLike?.matchedFrom || vendorNorm || ""
-  ).trim();
+const vendorNorm = String(
+  vendorLike?.vendorNorm ||
+  vendorLike?.vendorName ||
+  vendorLike?.vendorRaw ||
+  vendorLike?.canonical ||
+  ""
+).trim();
+
+const vendorRaw = String(
+  vendorLike?.vendorRaw ||
+  vendorLike?.matchedFrom ||
+  vendorLike?.vendorMatchedFrom ||
+  vendorLike?.vendorName ||
+  vendorNorm ||
+  ""
+).trim();
 
   if (!vendorNorm) return next;
 
@@ -519,8 +529,12 @@ async function enrichPlanWithVendorOcr({ plan, pdfPath, jobId, onProgress }) {
           vendorConfidence: matchedAfterOcr.score,
           matchedFrom: matchedAfterOcr.matchedFrom
         });
-      } else if (ocr?.vendorNorm || ocr?.vendorRaw) {
-        group = applyVendorToGroup(group, ocr);
+      } else if (ocr?.vendorNorm || ocr?.vendorRaw || ocr?.vendorName) {
+        group = applyVendorToGroup(group, {
+          ...ocr,
+          vendorNorm: ocr?.vendorNorm || ocr?.vendorName || "",
+          vendorRaw: ocr?.vendorRaw || ocr?.vendorMatchedFrom || ocr?.vendorName || ""
+        });
       }
     } catch (err) {
       console.error(

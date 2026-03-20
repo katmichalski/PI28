@@ -3,10 +3,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { VENDOR_XLSX_PATH } from "../config.js";
 
 const execFileAsync = promisify(execFile);
 const PDFTOPPM_BIN = process.env.PDFTOPPM_BIN || "pdftoppm";
 const TESSERACT_BIN = process.env.TESSERACT_BIN || "tesseract";
+const DEFAULT_VENDOR_XLSX_PATH = VENDOR_XLSX_PATH || process.env.VENDOR_XLSX_PATH || "";
 
 async function run(bin, args) {
   try {
@@ -215,8 +217,8 @@ function scoreVendorCandidateText(candidate, catalog) {
 }
 
 function extractVendorName(lines, pageWidth, pageHeight, vendorCatalog) {
-  const topLines = lines.filter((line) => line.top <= pageHeight * 0.18);
-  const vendorZone = topLines.filter((line) => line.left <= pageWidth * 0.75);
+  const topLines = lines.filter((line) => line.top <= pageHeight * 0.22);
+  const vendorZone = topLines.filter((line) => line.left <= pageWidth * 0.65);
 
   let bestMatch = null;
   const windows = [];
@@ -345,14 +347,13 @@ export async function extractInvoiceFieldsFromPdfPage({
   pdfPath,
   pageNumber,
   vendorNames = [],
-  vendorXlsxPath = ""
+  vendorXlsxPath = DEFAULT_VENDOR_XLSX_PATH
 }) {
   const loadedVendorNames = vendorNames.length
     ? vendorNames
     : await loadVendorNamesFromXlsx(vendorXlsxPath);
 
   const vendorCatalog = buildVendorCatalog(loadedVendorNames);
-
   const { dir, imagePath } = await renderPdfPageToPng(pdfPath, pageNumber);
 
   try {
@@ -360,15 +361,28 @@ export async function extractInvoiceFieldsFromPdfPage({
     const vendor = extractVendorName(lines, pageWidth, pageHeight, vendorCatalog);
     const invoiceNumber = extractInvoiceNumber(lines, pageWidth, pageHeight);
 
+    const vendorValue = vendor.vendorName || "UNKNOWN_VENDOR";
+    const vendorMatched = vendorValue !== "UNKNOWN_VENDOR";
+
     return {
+      kind: "pdf-ocr",
       pageNumber,
       text,
       words: text.split(/\s+/).filter(Boolean),
-      vendorName: vendor.vendorName || "UNKNOWN_VENDOR",
+      rawLines: lines.map((line) => line.text),
+
+      vendorName: vendorValue,
+      vendorNorm: vendorValue,
+      vendorRaw: vendor.matchedFrom || vendorValue,
+      vendorMatched,
+      vendorConfidence: Number(vendor.score || 0),
       vendorMatchedFrom: vendor.matchedFrom || "",
-      vendorScore: vendor.score || 0,
+
       invoiceNumber: invoiceNumber || "",
-      rawLines: lines.map((line) => line.text)
+      invoiceNo: invoiceNumber || "",
+      invoiceNum: invoiceNumber || "",
+      invoice_number: invoiceNumber || "",
+      INVOICENUMBER: invoiceNumber || ""
     };
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
@@ -379,7 +393,7 @@ export async function extractInvoiceFieldsFromPdfPages({
   pdfPath,
   pageNumbers,
   vendorNames = [],
-  vendorXlsxPath = ""
+  vendorXlsxPath = DEFAULT_VENDOR_XLSX_PATH
 }) {
   const results = [];
   for (const pageNumber of pageNumbers || []) {
